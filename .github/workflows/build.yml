@@ -19,8 +19,12 @@ jobs:
         run: |
           curl -L -o psn00bsdk.zip https://github.com/Lameguy64/PSn00bSDK/releases/download/v0.24/PSn00bSDK-0.24-Linux.zip
           unzip -q psn00bsdk.zip -d $HOME/psn00bsdk
-          echo "PSN00BSDK_LIBS=$HOME/psn00bsdk/lib/libpsn00b" >> $GITHUB_ENV
           echo "$HOME/psn00bsdk/bin" >> $GITHUB_PATH
+
+      - name: Lihat isi SDK
+        run: |
+          ls -R $HOME/psn00bsdk | head -80
+          find $HOME/psn00bsdk -name "sdk.cmake"
 
       - name: Build
         run: |

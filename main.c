@@ -6,7 +6,7 @@
 #include <psxapi.h>
 
 #define OT_LEN     9
-#define BUFFER_LEN 98304
+#define BUFFER_LEN 131072
 #define SCREEN_W   320
 #define SCREEN_H   240
 
@@ -20,17 +20,14 @@ typedef struct {
 static RenderBuffer buffers[2];
 static uint8_t     *nextpri;
 static int          active;
-static uint8_t      padbuf[2][34];
-static uint16_t     prevBtn = 0xFFFF;
+
+#define MAX_PLAYERS 4
+static uint8_t padbuf[2][34];
+static uint16_t prevBtn[MAX_PLAYERS] = { 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF };
 
 enum { L_HUD_TOP = 0, L_HUD_BASE = 1, L_GLOW = 2, L_FX = 3, L_PLAYER = 4,
        L_BULLET = 5, L_ENEMY = 6, L_PLANET = 7, L_BG = 8 };
 
-/* Field generik Enemy dipakai beda arti tergantung type (dijelaskan di
-   masing-masing case). shield: sisa perisai (SHIELDED) / status
-   tampak-kebal (PHANTOM, 1=solid 0=phasing). timer: cooldown tembak
-   (SHOOTER) / hitung mundur ganti fase (PHANTOM) / centerY awal (ORBITER).
-   vx: arah shard / dive-flag (STINGER) / centerX awal (ORBITER). */
 typedef struct { int x, y, alive, hp, type, t, shield, timer, vx; } Enemy;
 typedef struct { int x, y, alive, dx; } Bullet;
 typedef struct { int x, y, alive, vy; } EBullet;
@@ -40,32 +37,85 @@ typedef struct { int x, y, speed, layer, phase; } Star;
 typedef struct { int x, y, alive, type; } Item;
 typedef struct { int x, y, phase, timer, alive; } NovaBurst;
 
-#define MAX_BULLETS    16
-#define MAX_EBULLETS   12
-#define MAX_ENEMIES    14
-#define MAX_EXPLOSIONS 8
-#define MAX_SPARKS     40
-#define MAX_ITEMS      8
-#define MAX_NOVABURST  3
+#define MAX_BULLETS    48
+#define MAX_EBULLETS   16
+#define MAX_ENEMIES    24
+#define MAX_EXPLOSIONS 12
+#define MAX_SPARKS     56
+#define MAX_ITEMS      10
+#define MAX_NOVABURST  4
 #define NUM_STARS      50
 #define START_LIVES    3
 #define MAX_LIVES      5
 #define EXPLOSION_LEN  20
 #define NOVA_WARN      24
 #define NOVA_ACTIVE    18
+#define NOVA_LEN       220
 
 #define HUD_H   30
 #define TEXT_Y  12
 
 #define MAX_STACK        3
-#define SHIELD_DURATION  260   /* ~4.3 detik @60fps */
-#define POWER_DURATION   200   /* ~3.3 detik */
-#define SPEED_DURATION   220   /* ~3.6 detik */
+#define SHIELD_DURATION  260
+#define POWER_DURATION   200
+#define SPEED_DURATION   220
+
+#define ENEMY_CAP_BASE   6
 
 enum { STATE_MENU, STATE_PLAY, STATE_GAMEOVER, STATE_GACHA, STATE_SKINSELECT };
 enum { E_DRONE = 0, E_ZIGZAG, E_TANK, E_SPINNER, E_SHOOTER, E_SPLITTER, E_SHIELDED,
        E_STINGER, E_ORBITER, E_PHANTOM, E_JUGGERNAUT, E_NOVA, E_SHARD, E_BOSS };
 enum { ITEM_HEAL = 0, ITEM_SHIELD = 1, ITEM_POWER = 2, ITEM_SPEED = 3 };
+
+/* ---------- [MAD] Boss rahasia ---------- */
+#define MAD_HP        90
+#define MAX_MISSILES  14
+#define MAX_BOMBS     3
+#define MAX_MLASERS   3
+#define MLASER_WARN   40
+#define MLASER_FIRE   108   /* 1,8 detik @60fps */
+#define MAD_ATTACKS   5
+
+enum { MAD_IDLE = 0, MAD_LOCK, MAD_DASH, MAD_BOMB, MAD_LASER, MAD_SWARM, MAD_NOVA, MAD_DYING };
+/* Indeks serangan: 0 rudal balistik, 1 bom, 2 laser, 3 hujan rudal, 4 nova */
+
+typedef struct {
+    int alive, x, y, hp, maxhp;
+    int state, timer, lastAtk;
+    int dir, dirT;
+    int vx, vy;
+    int tx, ty;
+    int hit;
+    int dyingT;
+    int phase2;
+} MadBoss;
+
+typedef struct { int x, y, vx, vy, hp, alive; } Missile;
+typedef struct { int x, y, timer, alive; } Bomb;
+typedef struct { int x, y, angle, timer, alive; } MLaser;
+
+static MadBoss  mad;
+static Missile  missiles[MAX_MISSILES];
+static Bomb     mbombs[MAX_BOMBS];
+static MLaser   mlasers[MAX_MLASERS];
+static int      madSpawned = 0;
+static int      konami = 0;
+static int      forceMad = 0;
+
+/* ---------- Pemain ---------- */
+typedef struct {
+    int active;
+    int alive;
+    int x, y;
+    int lives, invuln, cooldown;
+    int score;
+    int skin;
+    int shieldStack, shieldTimer;
+    int powerStack,  powerTimer;
+    int speedStack,  speedTimer;
+} Player;
+
+static Player players[MAX_PLAYERS];
 
 static Bullet    bullets[MAX_BULLETS];
 static EBullet   ebullets[MAX_EBULLETS];
@@ -78,9 +128,12 @@ static NovaBurst novabursts[MAX_NOVABURST];
 
 static int shootX = -100, shootY = 0, shootT = 0;
 
-static int shieldStack = 0, shieldTimer = 0;
-static int powerStack  = 0, powerTimer  = 0;
-static int speedStack  = 0, speedTimer  = 0;
+static const int playerColor[MAX_PLAYERS][3] = {
+    {  80, 160, 255 },
+    { 255,  90,  90 },
+    {  90, 230, 120 },
+    { 255, 220,  80 }
+};
 
 static const int8_t sin16[16] = {
     0, 49, 90, 117, 127, 117, 90, 49, 0, -49, -90, -117, -127, -117, -90, -49
@@ -94,8 +147,17 @@ static const int8_t sinTab[32] = {
 };
 static int sinS(int t) { return sinTab[t & 31]; }
 
-static int pressed(uint16_t btn, uint16_t mask) {
-    return !(btn & mask) && (prevBtn & mask);
+static const int8_t sin64[64] = {
+    0, 12, 25, 37, 49, 60, 71, 81, 90, 98, 106, 112, 117, 122, 125, 126,
+    127, 126, 125, 122, 117, 112, 106, 98, 90, 81, 71, 60, 49, 37, 25, 12,
+    0, -12, -25, -37, -49, -60, -71, -81, -90, -98, -106, -112, -117, -122, -125, -126,
+    -127, -126, -125, -122, -117, -112, -106, -98, -90, -81, -71, -60, -49, -37, -25, -12
+};
+static int sinO(int t) { return sin64[t & 63]; }
+static int cosO(int t) { return sin64[(t + 16) & 63]; }
+
+static int pressedP(int pl, uint16_t btn, uint16_t mask) {
+    return !(btn & mask) && (prevBtn[pl] & mask);
 }
 
 static void initVideo(void) {
@@ -231,8 +293,6 @@ static void burst(int layer, int cx, int cy, int rOut, int rIn, int rot,
     }
 }
 
-/* Balok cahaya lurus menembus layar pada sudut tertentu (index sudut
-   16-langkah). Dipakai untuk laser silang Nova. */
 static void beamQuad(int layer, int cx, int cy, int angle, int len, int thick,
                      int r, int g, int b, int trans) {
     int dx = cosI(angle), dy = sinI(angle);
@@ -249,15 +309,14 @@ static void beamQuad(int layer, int cx, int cy, int angle, int len, int thick,
     nextpri += sizeof(POLY_F4);
 }
 
-/* Cek jarak titik (px,py) ke garis lurus tak-hingga melalui (bx,by)
-   dengan sudut `angle`. Dipakai untuk collision laser Nova. */
-static int beamHit(int bx, int by, int angle, int halfThick, int px, int py) {
+static int beamHit(int bx, int by, int angle, int len, int halfThick, int px, int py) {
     int dx = cosI(angle), dy = sinI(angle);
     int rx = px - bx, ry = py - by;
+    int along = (rx * dx + ry * dy) / 127;
+    if (along < -len || along > len) return 0;
     int cross = rx * dy - ry * dx;
     if (cross < 0) cross = -cross;
-    int dist = cross / 127;
-    return dist < halfThick;
+    return (cross / 127) < halfThick;
 }
 
 /* ---------- UI melengkung ---------- */
@@ -409,7 +468,6 @@ static const SkinDef skinTable[NUM_SKINS] = {
 };
 
 static unsigned int unlockedMask = 1;
-static int currentSkin = 0;
 static int skinCursor  = 0;
 
 /* ---------- Gacha system ---------- */
@@ -449,10 +507,9 @@ static int doGachaPull(void) {
     return 1;
 }
 
-/* ---------- Item: drop, update, gambar ---------- */
+/* ---------- Item ---------- */
 
-static void spawnItem(int x, int y) {
-    if (rand() % 100 >= 8) return;   /* 8% peluang drop -- dipersempit */
+static void putItem(int x, int y) {
     for (int i = 0; i < MAX_ITEMS; i++) {
         if (items[i].alive) continue;
         items[i].x = x; items[i].y = y;
@@ -462,15 +519,8 @@ static void spawnItem(int x, int y) {
     }
 }
 
-static void forceSpawnItem(int x, int y) {
-    for (int i = 0; i < MAX_ITEMS; i++) {
-        if (items[i].alive) continue;
-        items[i].x = x; items[i].y = y;
-        items[i].type = rand() % 4;
-        items[i].alive = 1;
-        return;
-    }
-}
+static void spawnItem(int x, int y)      { if (rand() % 100 < 8) putItem(x, y); }
+static void forceSpawnItem(int x, int y) { putItem(x, y); }
 
 static void drawItem(const Item *it, int frame) {
     int x = it->x, y = it->y;
@@ -498,66 +548,63 @@ static void drawItem(const Item *it, int frame) {
     }
 }
 
-static void applyItem(int type, int *lives) {
+static void applyItem(Player *pl, int type) {
     switch (type) {
     case ITEM_HEAL:
-        if (*lives < MAX_LIVES) (*lives)++;
+        if (pl->lives < MAX_LIVES) pl->lives++;
         break;
     case ITEM_SHIELD:
-        shieldStack = (shieldStack < MAX_STACK) ? shieldStack + 1 : MAX_STACK;
-        shieldTimer = SHIELD_DURATION;
+        pl->shieldStack = (pl->shieldStack < MAX_STACK) ? pl->shieldStack + 1 : MAX_STACK;
+        pl->shieldTimer = SHIELD_DURATION;
         break;
     case ITEM_POWER:
-        powerStack = (powerStack < MAX_STACK) ? powerStack + 1 : MAX_STACK;
-        powerTimer = POWER_DURATION;
+        pl->powerStack = (pl->powerStack < MAX_STACK) ? pl->powerStack + 1 : MAX_STACK;
+        pl->powerTimer = POWER_DURATION;
         break;
     case ITEM_SPEED:
-        speedStack = (speedStack < MAX_STACK) ? speedStack + 1 : MAX_STACK;
-        speedTimer = SPEED_DURATION;
+        pl->speedStack = (pl->speedStack < MAX_STACK) ? pl->speedStack + 1 : MAX_STACK;
+        pl->speedTimer = SPEED_DURATION;
         break;
     }
 }
 
-/* ---------- Ikon status buff (pojok kanan bawah) ---------- */
+/* ---------- Ikon buff ---------- */
 
 static void drawBuffIcon(int x, int y, int r, int g, int b,
                          int shape, int stack, int timer, int maxTimer) {
-    disc(L_HUD_TOP, x, y, 8, r / 3, g / 3, b / 3, 10, 10, 15);
-    glowDisc(x, y, 9, r, g, b, 8);
+    disc(L_HUD_TOP, x, y, 6, r / 3, g / 3, b / 3, 10, 10, 15);
+    glowDisc(x, y, 7, r, g, b, 6);
 
     switch (shape) {
-    case 0:
-        disc(L_HUD_TOP, x, y, 4, r, g, b, r / 2, g / 2, b / 2);
-        break;
-    case 1:
-        tri(L_HUD_TOP, x, y - 4, 255, 255, 255, x - 4, y + 4, r, g, b, x + 4, y + 4, r, g, b);
-        break;
-    case 2:
-        tri(L_HUD_TOP, x - 4, y - 4, 255, 255, 255, x - 4, y + 4, r, g, b, x + 4, y, r, g, b);
-        break;
+    case 0: disc(L_HUD_TOP, x, y, 3, r, g, b, r / 2, g / 2, b / 2); break;
+    case 1: tri(L_HUD_TOP, x, y - 3, 255, 255, 255, x - 3, y + 3, r, g, b, x + 3, y + 3, r, g, b); break;
+    case 2: tri(L_HUD_TOP, x - 3, y - 3, 255, 255, 255, x - 3, y + 3, r, g, b, x + 3, y, r, g, b); break;
     }
-
     for (int i = 0; i < stack; i++)
-        rect(L_HUD_TOP, x - 6 + i * 5, y + 11, 3, 3, r, g, b);
-
-    int w = 16 * timer / maxTimer;
-    rect(L_HUD_BASE, x - 8, y + 15, 16, 2, 40, 40, 50);
-    rect(L_HUD_BASE, x - 8, y + 15, w, 2, r, g, b);
+        rect(L_HUD_TOP, x - 5 + i * 4, y + 8, 3, 2, r, g, b);
+    int w = 12 * timer / maxTimer;
+    rect(L_HUD_BASE, x - 6, y + 11, 12, 2, 40, 40, 50);
+    rect(L_HUD_BASE, x - 6, y + 11, w, 2, r, g, b);
 }
 
 static void drawActiveBuffs(void) {
-    int x = SCREEN_W - 20, y = SCREEN_H - 26;
-    if (shieldStack > 0) { drawBuffIcon(x, y, 80, 180, 255, 0, shieldStack, shieldTimer, SHIELD_DURATION); x -= 26; }
-    if (powerStack  > 0) { drawBuffIcon(x, y, 255, 120, 40, 1, powerStack,  powerTimer,  POWER_DURATION);  x -= 26; }
-    if (speedStack  > 0) { drawBuffIcon(x, y, 255, 240, 80, 2, speedStack,  speedTimer,  SPEED_DURATION);  x -= 26; }
+    for (int p = 0; p < MAX_PLAYERS; p++) {
+        const Player *pl = &players[p];
+        if (!pl->active || !pl->alive) continue;
+        int x = 14 + p * 78;
+        int y = SCREEN_H - 22;
+        if (pl->shieldStack > 0) { drawBuffIcon(x, y, 80, 180, 255, 0, pl->shieldStack, pl->shieldTimer, SHIELD_DURATION); x += 20; }
+        if (pl->powerStack  > 0) { drawBuffIcon(x, y, 255, 120, 40, 1, pl->powerStack,  pl->powerTimer,  POWER_DURATION);  x += 20; }
+        if (pl->speedStack  > 0) { drawBuffIcon(x, y, 255, 240, 80, 2, pl->speedStack,  pl->speedTimer,  SPEED_DURATION);  x += 20; }
+    }
 }
 
-static void drawShieldAura(int px, int py, int frame) {
-    if (shieldStack <= 0) return;
-    int cx = px + 8, cy = py + 8;
-    int rad = 12 + shieldStack * 4;
+static void drawShieldAura(const Player *pl, int frame) {
+    if (pl->shieldStack <= 0) return;
+    int cx = pl->x + 8, cy = pl->y + 8;
+    int rad = 12 + pl->shieldStack * 4;
     glowDisc(cx, cy, rad, 80, 180, 255, 8);
-    for (int i = 0; i < shieldStack; i++) {
+    for (int i = 0; i < pl->shieldStack; i++) {
         int a = (frame * 2 + i * (16 / MAX_STACK)) & 15;
         int ox = cx + cosI(a) * rad / 127;
         int oy = cy + sinI(a) * rad / 127;
@@ -598,7 +645,14 @@ static void drawPlayer(int x, int y, int frame, int skin) {
                   cx + 3, y + 9, 40, 160, 230);
 }
 
-/* ---------- Musuh lama (dipoles dengan aksen highlight tambahan) ---------- */
+static void drawPlayerTag(int p, int x, int y) {
+    const int *c = playerColor[p];
+    tri(L_HUD_TOP, x + 8, y - 12, 255, 255, 255,
+                   x + 3, y - 20, c[0], c[1], c[2],
+                   x + 13, y - 20, c[0], c[1], c[2]);
+}
+
+/* ---------- Musuh ---------- */
 
 static void drawDrone(const Enemy *e, int frame) {
     int x = e->x, y = e->y, cx = x + 8;
@@ -612,6 +666,7 @@ static void drawDrone(const Enemy *e, int frame) {
 }
 
 static void drawZigzag(const Enemy *e, int frame) {
+    (void)frame;
     int x = e->x, y = e->y, cx = x + 8;
     glowDisc(cx, y + 5, 4, 255, 255, 120, 8);
     tri(L_ENEMY, x - 4,  y + 4,  60, 255, 140,  x + 6,  y + 2,  10, 120, 60,  x + 6,  y + 12, 20, 160, 90);
@@ -632,6 +687,7 @@ static void drawTank(const Enemy *e, int frame) {
 }
 
 static void drawSpinner(const Enemy *e, int frame) {
+    (void)frame;
     int cx = e->x + 11, cy = e->y + 11;
     int rot = (e->t / 2) & 15;
     glowDisc(cx, cy, 5, 220, 100, 255, 8);
@@ -696,8 +752,6 @@ static void drawShard(const Enemy *e, int frame) {
     tri(L_ENEMY, cx, cy - 5, 255, 200, 120, cx - 5, cy + 5, 200, 60, 30, cx + 5, cy + 5, 200, 60, 30);
 }
 
-/* ---------- 5 musuh baru ---------- */
-
 static void drawStinger(const Enemy *e, int frame) {
     int x = e->x, y = e->y, cx = x + 8;
     int glow = 180 + ((frame / 2) & 1) * 60;
@@ -714,16 +768,17 @@ static void drawOrbiter(const Enemy *e, int frame) {
     tri(L_ENEMY, cx - 14, cy, 60, 180, 220, cx + 14, cy, 60, 180, 220, cx, cy - 6, 200, 240, 255);
     tri(L_ENEMY, cx - 14, cy, 40, 120, 160, cx + 14, cy, 40, 120, 160, cx, cy + 6, 20, 60, 100);
     disc(L_ENEMY, cx, cy - 4, 5, 220, 250, 255, 120, 200, 240);
-    int rot = (frame / 2) & 15;
+    int base = (frame / 3) & 63;
     for (int i = 0; i < 3; i++) {
-        int a = (rot + i * 5) & 15;
-        int ox = cx + cosI(a) * 13 / 127, oy = cy + sinI(a) * 5 / 127;
+        int a = (base + i * 21) & 63;
+        int ox = cx + cosO(a) * 13 / 127;
+        int oy = cy + sinO(a) * 5  / 127;
         discLo(L_ENEMY, ox, oy, 2, 255, 255, 180, 200, 200, 100);
     }
 }
 
 static void drawPhantom(const Enemy *e, int frame) {
-    if (e->shield == 0 && (frame & 2)) return; /* flicker saat phasing */
+    if (e->shield == 0 && (frame & 2)) return;
     int cx = e->x + 8, cy = e->y + 8;
     int a = e->shield ? 255 : 130;
     glowDisc(cx, cy, 8, 160, 120, 255, 8);
@@ -781,6 +836,7 @@ static void drawEnemy(const Enemy *e, int frame) {
         rect(L_FX, bx - 6, by - 8, 60, 4, 50, 10, 10);
         int w = e->hp * 60 / 30;
         if (w < 0) w = 0;
+        if (w > 60) w = 60;
         rect(L_FX, bx - 6, by - 8, w, 4, 255, 60, 60);
         glowDisc(bx + 19, by + 15, 5, glow, 40, 0, 8);
         glowDisc(bx + 29, by + 15, 5, glow, 40, 0, 8);
@@ -792,7 +848,7 @@ static void drawEnemy(const Enemy *e, int frame) {
     }
 }
 
-/* ---------- Laser pemain, peluru musuh & burst Nova ---------- */
+/* ---------- Laser pemain, peluru musuh, burst Nova ---------- */
 
 static void drawLaser(int x, int y, int frame) {
     int fl = ((frame / 2) & 1) * 20;
@@ -828,20 +884,19 @@ static void spawnNovaBurst(int x, int y) {
 }
 
 static void drawNovaBurst(const NovaBurst *n, int frame) {
-    int len = 220;
     if (n->phase == 0) {
         if ((frame & 3) < 2) {
-            beamQuad(L_FX, n->x, n->y, 0, len, 2, 255, 60, 60, 0);
-            beamQuad(L_FX, n->x, n->y, 4, len, 2, 255, 60, 60, 0);
-            beamQuad(L_FX, n->x, n->y, 2, len, 2, 255, 60, 60, 0);
-            beamQuad(L_FX, n->x, n->y, 6, len, 2, 255, 60, 60, 0);
+            beamQuad(L_FX, n->x, n->y, 0, NOVA_LEN, 2, 255, 60, 60, 0);
+            beamQuad(L_FX, n->x, n->y, 4, NOVA_LEN, 2, 255, 60, 60, 0);
+            beamQuad(L_FX, n->x, n->y, 2, NOVA_LEN, 2, 255, 60, 60, 0);
+            beamQuad(L_FX, n->x, n->y, 6, NOVA_LEN, 2, 255, 60, 60, 0);
         }
         glowDisc(n->x, n->y, 10, 255, 80, 80, 8);
     } else {
-        beamQuad(L_FX, n->x, n->y, 0, len, 12, 255, 255, 255, 0);
-        beamQuad(L_FX, n->x, n->y, 4, len, 12, 255, 255, 255, 0);
-        beamQuad(L_FX, n->x, n->y, 2, len, 12, 255, 255, 255, 0);
-        beamQuad(L_FX, n->x, n->y, 6, len, 12, 255, 255, 255, 0);
+        beamQuad(L_FX, n->x, n->y, 0, NOVA_LEN, 12, 255, 255, 255, 0);
+        beamQuad(L_FX, n->x, n->y, 4, NOVA_LEN, 12, 255, 255, 255, 0);
+        beamQuad(L_FX, n->x, n->y, 2, NOVA_LEN, 12, 255, 255, 255, 0);
+        beamQuad(L_FX, n->x, n->y, 6, NOVA_LEN, 12, 255, 255, 255, 0);
         glowDisc(n->x, n->y, 20, 150, 200, 255, 8);
     }
 }
@@ -932,33 +987,43 @@ static void spawnShards(int x, int y) {
 
 /* ---------- HUD ---------- */
 
-static void drawHUD(int lives, int level) {
-    for (int i = 0; i < MAX_LIVES; i++) {
-        int lx = SCREEN_W - 20 - i * 14;
-        if (i < lives) {
-            tri(L_HUD_TOP, lx + 5, 8,  255, 255, 255,  lx, 21, 60, 120, 230,  lx + 10, 21, 60, 120, 230);
-            rect(L_HUD_TOP, lx + 4, 20, 2, 3, 255, 150, 30);
-        } else {
-            tri(L_HUD_TOP, lx + 5, 8,  60, 60, 80,  lx, 21, 30, 30, 50,  lx + 10, 21, 30, 30, 50);
-        }
-    }
+static void drawHUD(int level) {
     for (int i = 0; i < 10; i++) {
         int cx = 10 + i * 9;
-        if (i < level) glowDisc(cx, 26, 3, 0, 230, 140, 8);
+        if (i < level) glowDisc(cx, 26, 3, 0, 230, 140, 6);
         else           discLo(L_HUD_TOP, cx, 26, 2, 30, 40, 60, 20, 25, 40);
     }
+
+    for (int p = 0; p < MAX_PLAYERS; p++) {
+        const Player *pl = &players[p];
+        if (!pl->active) continue;
+        const int *c = playerColor[p];
+        int bx = SCREEN_W - 8 - (MAX_PLAYERS - p) * 42;
+        rect(L_HUD_TOP, bx, 6, 6, 6, c[0], c[1], c[2]);
+        for (int i = 0; i < MAX_LIVES; i++) {
+            if (i < pl->lives)
+                rect(L_HUD_TOP, bx + i * 7, 15, 5, 6, c[0], c[1], c[2]);
+            else
+                rect(L_HUD_TOP, bx + i * 7, 15, 5, 6, 40, 40, 55);
+        }
+    }
+
     roundedPanel(L_HUD_BASE, 0, 0, SCREEN_W, HUD_H, 10, 20, 40, 90, 1);
     rect(L_HUD_BASE, 0, HUD_H, SCREEN_W, 1, 90, 170, 255);
     setBlendMode(L_HUD_BASE, 0);
 }
 
-static void drawMenu(int frame) {
+static void drawMenu(int frame, int nPlayers) {
     roundedPanel(L_HUD_BASE, 40, 52, 240, 44, 12, 255, 150, 40, 0);
     roundedPanel(L_HUD_TOP, 40, 52, 240, 44, 12, 255, 255, 255, 1);
     setBlendMode(L_HUD_TOP, 0);
     glowDisc(160, 74, 90, 255, 180, 60, 8);
     int bob = sinS(frame / 2) / 20;
-    drawPlayer(SCREEN_W / 2 - 8, 140 + bob, frame, currentSkin);
+    int n = nPlayers < 1 ? 1 : nPlayers;
+    for (int p = 0; p < n; p++) {
+        int x = SCREEN_W / 2 - 8 + (p * 44 - (n - 1) * 22);
+        drawPlayer(x, 140 + bob, frame, players[p].skin);
+    }
 }
 
 static void drawGachaScreen(int frame) {
@@ -990,7 +1055,7 @@ static void drawSkinSelectScreen(int frame) {
     }
 }
 
-/* ---------- Logika ---------- */
+/* ---------- Logika umum ---------- */
 
 static int overlap(int ax, int ay, int aw, int ah, int bx, int by, int bw, int bh) {
     return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
@@ -1014,8 +1079,66 @@ static void enemySize(const Enemy *e, int *w, int *h) {
     }
 }
 
-static void resetGame(int *px, int *py, int *score, int *lives,
-                      int *invuln, int *frame, int *cooldown, int *bossOn) {
+static int countActive(void) {
+    int n = 0;
+    for (int p = 0; p < MAX_PLAYERS; p++) if (players[p].active) n++;
+    return n;
+}
+
+static int countAlive(void) {
+    int n = 0;
+    for (int p = 0; p < MAX_PLAYERS; p++)
+        if (players[p].active && players[p].alive) n++;
+    return n;
+}
+
+static int totalScore(void) {
+    int s = 0;
+    for (int p = 0; p < MAX_PLAYERS; p++) if (players[p].active) s += players[p].score;
+    return s;
+}
+
+static int nearestPlayer(int x, int y) {
+    int best = -1, bestD = 0x7fffffff;
+    for (int p = 0; p < MAX_PLAYERS; p++) {
+        if (!players[p].active || !players[p].alive) continue;
+        int dx = players[p].x - x, dy = players[p].y - y;
+        int d = dx * dx + dy * dy;
+        if (d < bestD) { bestD = d; best = p; }
+    }
+    return best;
+}
+
+static void placePlayer(int p) {
+    Player *pl = &players[p];
+    pl->x = SCREEN_W / 2 - 8 + (p - 1) * 40 - 20;
+    if (pl->x < 4) pl->x = 4;
+    if (pl->x > SCREEN_W - 20) pl->x = SCREEN_W - 20;
+    pl->y = SCREEN_H - 34;
+}
+
+static void joinPlayer(int p) {
+    Player *pl = &players[p];
+    pl->active = 1;
+    pl->alive  = 1;
+    pl->lives  = START_LIVES;
+    pl->invuln = 90;
+    pl->cooldown = 0;
+    pl->score  = 0;
+    pl->shieldStack = pl->shieldTimer = 0;
+    pl->powerStack  = pl->powerTimer  = 0;
+    pl->speedStack  = pl->speedTimer  = 0;
+    placePlayer(p);
+}
+
+static void madReset(void) {
+    mad.alive = 0;
+    for (int i = 0; i < MAX_MISSILES; i++) missiles[i].alive = 0;
+    for (int i = 0; i < MAX_BOMBS; i++)    mbombs[i].alive = 0;
+    for (int i = 0; i < MAX_MLASERS; i++)  mlasers[i].alive = 0;
+}
+
+static void clearWorld(void) {
     for (int i = 0; i < MAX_BULLETS; i++)    bullets[i].alive = 0;
     for (int i = 0; i < MAX_EBULLETS; i++)   ebullets[i].alive = 0;
     for (int i = 0; i < MAX_ENEMIES; i++)    enemies[i].alive = 0;
@@ -1023,17 +1146,7 @@ static void resetGame(int *px, int *py, int *score, int *lives,
     for (int i = 0; i < MAX_SPARKS; i++)     sparks[i].alive = 0;
     for (int i = 0; i < MAX_ITEMS; i++)      items[i].alive = 0;
     for (int i = 0; i < MAX_NOVABURST; i++)  novabursts[i].alive = 0;
-    shieldStack = shieldTimer = 0;
-    powerStack  = powerTimer  = 0;
-    speedStack  = speedTimer  = 0;
-    *px       = SCREEN_W / 2 - 8;
-    *py       = SCREEN_H - 34;
-    *score    = 0;
-    *lives    = START_LIVES;
-    *invuln   = 0;
-    *frame    = 0;
-    *cooldown = 0;
-    *bossOn   = 0;
+    madReset();
 }
 
 static int pickEnemyType(int level) {
@@ -1048,10 +1161,173 @@ static int pickEnemyType(int level) {
     return pool[rand() % n];
 }
 
+static int countEnemies(void) {
+    int n = 0;
+    for (int i = 0; i < MAX_ENEMIES; i++)
+        if (enemies[i].alive && enemies[i].type != E_SHARD) n++;
+    return n;
+}
+
+static void hurtPlayer(int p) {
+    Player *pl = &players[p];
+    spawnExplosion(pl->x + 8, pl->y + 8, 0);
+    pl->lives--;
+    pl->invuln = 90;
+    if (pl->lives <= 0) {
+        pl->alive = 0;
+        spawnExplosion(pl->x + 8, pl->y + 8, 1);
+    }
+}
+
+static int readPad(int p, uint16_t *btn) {
+    if (p >= 2) { *btn = 0xFFFF; return 0; }
+    PADTYPE *pad = (PADTYPE *)padbuf[p];
+    if (pad->stat != 0) { *btn = 0xFFFF; return 0; }
+    *btn = pad->btn;
+    return 1;
+}
+
+/* ---------- [MAD] Mad Scientist Cruiser (desain orisinal) ---------- */
+
+static void drawMadCruiser(int x, int y, int frame, int hit) {
+    int cx = x + 24, cy = y + 20;
+    int body = hit ? 255 : 150;
+    int pulse = 4 + sinS(frame * 2) / 40;
+
+    glowDisc(x - 6,  y + 30, 6 + pulse, 80, 255, 120, 8);
+    glowDisc(x + 54, y + 30, 6 + pulse, 80, 255, 120, 8);
+    rect(L_ENEMY, x - 10, y + 26, 8, 6, 90, 100, 90);
+    rect(L_ENEMY, x + 50, y + 26, 8, 6, 90, 100, 90);
+
+    tri(L_ENEMY, x - 12, y + 8, body, body, 170,  x + 6, y + 18, 70, 80, 90,  x + 4, y + 34, 100, 110, 120);
+    tri(L_ENEMY, x + 58, y + 14, body, body, 170, x + 42, y + 20, 70, 80, 90, x + 44, y + 32, 100, 110, 120);
+
+    for (int i = 0; i < 16; i += 2) {
+        int x1 = cx + cosI(i)     * 26 / 127, y1 = cy + sinI(i)     * 15 / 127;
+        int x2 = cx + cosI(i + 2) * 26 / 127, y2 = cy + sinI(i + 2) * 15 / 127;
+        int lit = 110 + (cosI(i) + 127) / 4;
+        tri(L_ENEMY, cx, cy, lit, lit + 10, lit + 20, x1, y1, 60, 70, 85, x2, y2, 60, 70, 85);
+    }
+    rect(L_ENEMY, x + 8, y + 22, 32, 2, 40, 50, 60);
+    int blink = (frame / 6) % 3;
+    rect(L_ENEMY, x + 12, y + 26, 4, 3, blink == 0 ? 255 : 90, 60, 60);
+    rect(L_ENEMY, x + 22, y + 26, 4, 3, blink == 1 ? 255 : 90, 220, 60);
+    rect(L_ENEMY, x + 32, y + 26, 4, 3, 60, 120, blink == 2 ? 255 : 90);
+
+    glowDisc(cx, y + 8, 14, 60, 255, 140, 8);
+    disc(L_ENEMY, cx, y + 10, 11, 170, 255, 190, 30, 160, 80);
+    disc(L_ENEMY, cx - 4, y + 6, 4, 240, 255, 245, 160, 230, 190);
+
+    rect(L_ENEMY, cx + 8, y - 6, 2, 10, 200, 200, 210);
+    glowDisc(cx + 9, y - 8, 4, 255, 80, 200, 8);
+}
+
+static void madSpawn(int nPlayers) {
+    mad.alive = 1;
+    mad.x = SCREEN_W / 2 - 24; mad.y = HUD_H + 8;
+    mad.maxhp = MAD_HP + 30 * (nPlayers - 1);
+    mad.hp = mad.maxhp;
+    mad.state = MAD_IDLE; mad.timer = 90; mad.lastAtk = -1;
+    mad.dir = 0; mad.dirT = 0; mad.vx = 1; mad.vy = 0;
+    mad.hit = 0; mad.dyingT = 0; mad.phase2 = 0;
+}
+
+static void spawnMissile(int x, int y, int vx, int vy) {
+    for (int i = 0; i < MAX_MISSILES; i++) {
+        if (missiles[i].alive) continue;
+        missiles[i].x = x; missiles[i].y = y;
+        missiles[i].vx = vx; missiles[i].vy = vy;
+        missiles[i].hp = 2; missiles[i].alive = 1;
+        return;
+    }
+}
+
+static void spawnBomb(int x, int y) {
+    for (int i = 0; i < MAX_BOMBS; i++) {
+        if (mbombs[i].alive) continue;
+        mbombs[i].x = x; mbombs[i].y = y;
+        mbombs[i].timer = 100; mbombs[i].alive = 1;
+        return;
+    }
+}
+
+static void spawnMLaser(int x, int y, int angle) {
+    for (int i = 0; i < MAX_MLASERS; i++) {
+        if (mlasers[i].alive) continue;
+        mlasers[i].x = x; mlasers[i].y = y;
+        mlasers[i].angle = angle;
+        mlasers[i].timer = MLASER_WARN + MLASER_FIRE;
+        mlasers[i].alive = 1;
+        return;
+    }
+}
+
+/* Panggil Nova dari sisi kiri dan kanan boss */
+static void madSummonNova(void) {
+    int sides[2] = { mad.x - 14, mad.x + 46 };
+    for (int s = 0; s < 2; s++) {
+        for (int k = 0; k < MAX_ENEMIES; k++) {
+            if (enemies[k].alive) continue;
+            enemies[k].type = E_NOVA;
+            enemies[k].x = sides[s]; enemies[k].y = mad.y + 24;
+            enemies[k].hp = 3; enemies[k].t = 0;
+            enemies[k].shield = 0; enemies[k].timer = 0; enemies[k].vx = 0;
+            enemies[k].alive = 1;
+            break;
+        }
+    }
+}
+
+static void madMove(void) {
+    if (--mad.dirT <= 0) {
+        mad.dir = rand() % 3;
+        mad.dirT = 60 + rand() % 60;
+        int sp = mad.phase2 ? 3 : 2;
+        int sx = (rand() & 1) ? sp : -sp, sy = (rand() & 1) ? sp : -sp;
+        if (mad.dir == 0)      { mad.vx = sx; mad.vy = 0; }
+        else if (mad.dir == 1) { mad.vx = 0;  mad.vy = sy; }
+        else                   { mad.vx = sx; mad.vy = sy; }
+    }
+    mad.x += mad.vx; mad.y += mad.vy;
+    if (mad.x < 12)               { mad.x = 12;               mad.vx = -mad.vx; }
+    if (mad.x > SCREEN_W - 62)    { mad.x = SCREEN_W - 62;    mad.vx = -mad.vx; }
+    if (mad.y < HUD_H + 4)        { mad.y = HUD_H + 4;        mad.vy = -mad.vy; }
+    if (mad.y > HUD_H + 70)       { mad.y = HUD_H + 70;       mad.vy = -mad.vy; }
+}
+
+/* Pilih serangan acak; tidak boleh sama dengan sebelumnya. Di fase 2,
+   serangan berat (laser=2, nova=4) lebih sering dipilih. */
+static int madPickAttack(void) {
+    int a;
+    int tries = 0;
+    do {
+        a = rand() % MAD_ATTACKS;
+        if (mad.phase2 && (a == 0 || a == 1 || a == 3) && (rand() % 3 == 0))
+            a = (rand() & 1) ? 2 : 4;
+        tries++;
+    } while (a == mad.lastAtk && tries < 8);
+    return a;
+}
+
+static void madBeginAttack(void) {
+    int t = nearestPlayer(mad.x + 24, mad.y + 20);
+    if (t >= 0) { mad.tx = players[t].x + 8; mad.ty = players[t].y + 8; }
+    int a = madPickAttack();
+    mad.lastAtk = a;
+    switch (a) {
+    case 0: mad.state = MAD_LOCK;  mad.timer = 50; break;   /* rudal balistik */
+    case 1: mad.state = MAD_BOMB;  mad.timer = 30; break;
+    case 2: mad.state = MAD_LASER; mad.timer = 20; break;
+    case 3: mad.state = MAD_SWARM; mad.timer = 90; break;
+    case 4: mad.state = MAD_NOVA;  mad.timer = 30; break;
+    }
+}
+
 int main(void) {
-    int px, py, score, lives, invuln, frame, cooldown, bossOn;
+    int frame = 0;
     int state = STATE_MENU;
     int nextBossScore = 30;
+    int bossOn = 0;
 
     initVideo();
     initStars();
@@ -1063,17 +1339,23 @@ int main(void) {
     StartPAD();
     ChangeClearPAD(0);
 
-    resetGame(&px, &py, &score, &lives, &invuln, &frame, &cooldown, &bossOn);
+    for (int p = 0; p < MAX_PLAYERS; p++) {
+        players[p].active = 0;
+        players[p].alive = 0;
+        players[p].skin = 0;
+    }
+    madReset();
 
     ClearOTagR(buffers[0].ot, OT_LEN);
     nextpri = buffers[0].buf;
 
     while (1) {
-        PADTYPE *pad = (PADTYPE *)padbuf[0];
-        uint16_t btn = 0xFFFF;
-        if (pad->stat == 0) btn = pad->btn;
+        uint16_t btn[MAX_PLAYERS];
+        int connected[MAX_PLAYERS];
+        for (int p = 0; p < MAX_PLAYERS; p++)
+            connected[p] = readPad(p, &btn[p]);
 
-        int level = 1 + score / 10;
+        int level = 1 + totalScore() / 10;
         if (level > 10) level = 10;
 
         for (int i = 0; i < NUM_STARS; i++) {
@@ -1101,52 +1383,98 @@ int main(void) {
         }
 
         if (state == STATE_MENU) {
-            if (pressed(btn, PAD_START) || pressed(btn, PAD_CROSS)) {
-                resetGame(&px, &py, &score, &lives, &invuln, &frame, &cooldown, &bossOn);
-                nextBossScore = 30;
-                state = STATE_PLAY;
-            } else if (pressed(btn, PAD_SELECT)) {
-                state = STATE_GACHA;
-            } else if (pressed(btn, PAD_SQUARE)) {
-                state = STATE_SKINSELECT;
-            }
-        } else if (state == STATE_PLAY) {
-            if (!(btn & PAD_LEFT)  && px > 0)             px -= 3;
-            if (!(btn & PAD_RIGHT) && px < SCREEN_W - 16) px += 3;
-            if (!(btn & PAD_UP)    && py > HUD_H + 16)    py -= 2;
-            if (!(btn & PAD_DOWN)  && py < SCREEN_H - 24) py += 2;
-
-            if (shieldTimer > 0) { if (--shieldTimer <= 0) shieldStack = 0; }
-            if (powerTimer  > 0) { if (--powerTimer  <= 0) powerStack  = 0; }
-            if (speedTimer  > 0) { if (--speedTimer  <= 0) speedStack  = 0; }
-
-            if (cooldown > 0) cooldown--;
-            if (!(btn & PAD_CROSS) && cooldown == 0) {
-                int shots = (level >= 6) ? 3 : (level >= 3 ? 2 : 1);
-                int made = 0;
-                for (int i = 0; i < MAX_BULLETS && made < shots; i++) {
-                    if (bullets[i].alive) continue;
-                    int off = (shots == 1) ? 6 : (shots == 2 ? (made ? 12 : 0) : made * 6);
-                    bullets[i].x = px + off;
-                    bullets[i].y = py - 6;
-                    bullets[i].dx = (shots == 3) ? (made - 1) : 0;
-                    bullets[i].alive = 1;
-                    made++;
+            for (int p = 0; p < MAX_PLAYERS; p++) {
+                if (!connected[p]) continue;
+                if (pressedP(p, btn[p], PAD_START)) {
+                    if (!players[p].active) joinPlayer(p);
                 }
-                int cd = (level >= 5) ? 5 : 6;
-                cd -= speedStack * 2;
-                if (cd < 1) cd = 1;
-                cooldown = cd;
             }
 
-            int spawnEvery = 42 - level * 3;
-            if (spawnEvery < 12) spawnEvery = 12;
-            if (!bossOn && frame % spawnEvery == 0) {
+            /* [MAD] kode rahasia: Atas Atas Bawah Bawah Kiri Kanan Kiri Kanan O X */
+            if (connected[0]) {
+                static const uint16_t code[10] = { PAD_UP, PAD_UP, PAD_DOWN, PAD_DOWN,
+                    PAD_LEFT, PAD_RIGHT, PAD_LEFT, PAD_RIGHT, PAD_CIRCLE, PAD_CROSS };
+                uint16_t newly = (uint16_t)(~btn[0] & prevBtn[0] ? 0 : 0);
+                (void)newly;
+                uint16_t down = (uint16_t)(~btn[0]);           /* bit 1 = ditekan */
+                uint16_t wasUp = prevBtn[0];                   /* bit 1 = tidak ditekan sebelumnya */
+                uint16_t fresh = down & wasUp;                 /* baru ditekan frame ini */
+                if (fresh) {
+                    if (fresh & code[konami]) {
+                        if (++konami >= 10) { forceMad = 1; konami = 0; }
+                    } else {
+                        konami = 0;
+                    }
+                }
+            }
+
+            if (countActive() > 0 && connected[0] && pressedP(0, btn[0], PAD_CROSS) && konami == 0) {
+                clearWorld();
+                nextBossScore = 30;
+                bossOn = 0;
+                madSpawned = 0;
+                frame = 0;
+                state = STATE_PLAY;
+            }
+            if (connected[0] && pressedP(0, btn[0], PAD_SELECT)) state = STATE_GACHA;
+            if (connected[0] && pressedP(0, btn[0], PAD_SQUARE)) state = STATE_SKINSELECT;
+        } else if (state == STATE_PLAY) {
+            for (int p = 0; p < MAX_PLAYERS; p++) {
+                if (!connected[p] || players[p].active) continue;
+                if (pressedP(p, btn[p], PAD_START)) joinPlayer(p);
+            }
+
+            int nPlayers = countActive();
+            int enemyCap = ENEMY_CAP_BASE + 2 * (nPlayers - 1);
+            if (enemyCap > MAX_ENEMIES - 6) enemyCap = MAX_ENEMIES - 6;
+
+            for (int p = 0; p < MAX_PLAYERS; p++) {
+                Player *pl = &players[p];
+                if (!pl->active) continue;
+
+                if (pl->shieldTimer > 0) { if (--pl->shieldTimer <= 0) pl->shieldStack = 0; }
+                if (pl->powerTimer  > 0) { if (--pl->powerTimer  <= 0) pl->powerStack  = 0; }
+                if (pl->speedTimer  > 0) { if (--pl->speedTimer  <= 0) pl->speedStack  = 0; }
+                if (pl->invuln > 0) pl->invuln--;
+
+                if (!pl->alive || !connected[p]) continue;
+
+                uint16_t b = btn[p];
+                if (!(b & PAD_LEFT)  && pl->x > 0)             pl->x -= 3;
+                if (!(b & PAD_RIGHT) && pl->x < SCREEN_W - 16) pl->x += 3;
+                if (!(b & PAD_UP)    && pl->y > HUD_H + 16)    pl->y -= 2;
+                if (!(b & PAD_DOWN)  && pl->y < SCREEN_H - 24) pl->y += 2;
+
+                if (pl->cooldown > 0) pl->cooldown--;
+                if (!(b & PAD_CROSS) && pl->cooldown == 0) {
+                    int shots = (level >= 6) ? 3 : (level >= 3 ? 2 : 1);
+                    int made = 0;
+                    for (int i = 0; i < MAX_BULLETS && made < shots; i++) {
+                        if (bullets[i].alive) continue;
+                        int off = (shots == 1) ? 6 : (shots == 2 ? (made ? 12 : 0) : made * 6);
+                        bullets[i].x = pl->x + off;
+                        bullets[i].y = pl->y - 6;
+                        bullets[i].dx = (shots == 3) ? (made - 1) : 0;
+                        bullets[i].alive = 1;
+                        made++;
+                    }
+                    int cd = (level >= 5) ? 5 : 6;
+                    cd -= pl->speedStack * 2;
+                    if (cd < 1) cd = 1;
+                    pl->cooldown = cd;
+                }
+            }
+
+            int madBusy = mad.alive;
+
+            int spawnEvery = 42 - level * 3 - (nPlayers - 1) * 3;
+            if (spawnEvery < 10) spawnEvery = 10;
+            if (!bossOn && !madBusy && frame % spawnEvery == 0 && countEnemies() < enemyCap) {
                 for (int i = 0; i < MAX_ENEMIES; i++) {
                     if (enemies[i].alive) continue;
                     Enemy *e = &enemies[i];
                     e->type = pickEnemyType(level);
-                    e->x = 10 + rand() % (SCREEN_W - 40);
+                    e->x = 24 + rand() % (SCREEN_W - 56);
                     e->y = HUD_H + 2;
                     e->t = rand() % 32;
                     e->vx = 0;
@@ -1162,18 +1490,25 @@ int main(void) {
                         case E_STINGER:    e->hp = 1; e->shield = 0; e->timer = 0; e->vx = 0; break;
                         default:           e->hp = 1; e->shield = 0; e->timer = 0;  break;
                     }
+                    if (e->type != E_SHARD && nPlayers > 1) e->hp += (nPlayers - 1) / 2;
                     e->alive = 1;
                     break;
                 }
             }
 
-            if (!bossOn && score >= nextBossScore) {
+            {
+                int bossAlive = 0;
+                for (int i = 0; i < MAX_ENEMIES; i++)
+                    if (enemies[i].alive && enemies[i].type == E_BOSS) bossAlive = 1;
+                bossOn = bossAlive;
+            }
+            if (!bossOn && !mad.alive && totalScore() >= nextBossScore) {
                 for (int i = 0; i < MAX_ENEMIES; i++) {
                     if (enemies[i].alive) continue;
                     enemies[i].type = E_BOSS;
                     enemies[i].x = SCREEN_W / 2 - 24;
                     enemies[i].y = HUD_H + 2;
-                    enemies[i].hp = 30;
+                    enemies[i].hp = 30 + 10 * (nPlayers - 1);
                     enemies[i].t = 0;
                     enemies[i].shield = 0;
                     enemies[i].timer = 0;
@@ -1184,29 +1519,31 @@ int main(void) {
                 }
             }
 
+            /* [MAD] pemicu boss rahasia: kode rahasia atau skor total 100 */
+            if (!mad.alive && !bossOn && (forceMad || (totalScore() >= 100 && !madSpawned))) {
+                madSpawn(nPlayers);
+                madSpawned = 1;
+                forceMad = 0;
+            }
+
             for (int i = 0; i < MAX_BULLETS; i++) {
                 if (!bullets[i].alive) continue;
                 bullets[i].y -= 7;
                 bullets[i].x += bullets[i].dx;
                 if (bullets[i].y < HUD_H) bullets[i].alive = 0;
             }
-
             for (int i = 0; i < MAX_EBULLETS; i++) {
                 if (!ebullets[i].alive) continue;
                 ebullets[i].y += ebullets[i].vy;
                 if (ebullets[i].y > SCREEN_H) ebullets[i].alive = 0;
             }
-
             for (int i = 0; i < MAX_ITEMS; i++) {
                 if (!items[i].alive) continue;
                 items[i].y += 2;
                 if (items[i].y > SCREEN_H) items[i].alive = 0;
             }
 
-            if (invuln > 0) invuln--;
-
             int baseSpeed = 1 + level / 5;
-            int dmg = 1 + powerStack;
 
             for (int i = 0; i < MAX_ENEMIES; i++) {
                 Enemy *e = &enemies[i];
@@ -1214,6 +1551,9 @@ int main(void) {
                 e->t++;
                 int w, h;
                 enemySize(e, &w, &h);
+
+                int tgt = nearestPlayer(e->x, e->y);
+                int tx = (tgt >= 0) ? players[tgt].x : SCREEN_W / 2;
 
                 switch (e->type) {
                 case E_BOSS:
@@ -1255,7 +1595,7 @@ int main(void) {
                 case E_STINGER:
                     if (e->vx == 0) {
                         e->y += 2;
-                        if (e->x < px) e->x += 3; else if (e->x > px) e->x -= 3;
+                        if (e->x < tx) e->x += 3; else if (e->x > tx) e->x -= 3;
                         if (e->y > HUD_H + 50) e->vx = 1;
                     } else {
                         e->y += 7;
@@ -1263,10 +1603,12 @@ int main(void) {
                     break;
                 case E_ORBITER: {
                     int cxOrb = e->vx;
-                    int cyOrb = e->timer + e->t / 6;
-                    int ang = (e->t * 3) & 15;
-                    e->x = cxOrb + cosI(ang) * 24 / 127;
-                    e->y = cyOrb + sinI(ang) * 24 / 127;
+                    if (cxOrb < 30) cxOrb = 30;
+                    if (cxOrb > SCREEN_W - 30) cxOrb = SCREEN_W - 30;
+                    int cyOrb = e->timer + e->t / 4;
+                    int ang = (e->t / 3) & 63;
+                    e->x = cxOrb + cosO(ang) * 20 / 127;
+                    e->y = cyOrb + sinO(ang) * 12 / 127;
                     break;
                 }
                 case E_PHANTOM:
@@ -1289,140 +1631,311 @@ int main(void) {
 
                 if (e->type != E_BOSS && e->y > SCREEN_H) e->alive = 0;
 
+                int dmgBase = 1;
                 for (int j = 0; j < MAX_BULLETS; j++) {
                     if (!bullets[j].alive || !e->alive) continue;
-                    if (overlap(bullets[j].x, bullets[j].y, 4, 14, e->x, e->y, w, h)) {
-                        bullets[j].alive = 0;
+                    if (!overlap(bullets[j].x, bullets[j].y, 4, 14, e->x, e->y, w, h)) continue;
+                    bullets[j].alive = 0;
 
-                        if (e->type == E_PHANTOM && e->shield == 0) {
-                            spawnSparks(bullets[j].x + 2, bullets[j].y, 3, 160, 120, 255, 0);
-                            continue;
-                        }
-                        if (e->type != E_PHANTOM && e->shield > 0) {
-                            e->shield--;
-                            spawnSparks(bullets[j].x + 2, bullets[j].y, 4, 100, 200, 255, 0);
-                            continue;
-                        }
-
-                        e->hp -= dmg;
-                        spawnSparks(bullets[j].x + 2, bullets[j].y, 4, 120, 230, 255, 0);
-                        if (e->hp <= 0) {
-                            spawnExplosion(e->x + w / 2, e->y + h / 2,
-                                           e->type == E_BOSS || e->type == E_TANK || e->type == E_JUGGERNAUT);
-                            if (e->type == E_SPLITTER) spawnShards(e->x + w / 2, e->y + h / 2);
-                            if (e->type == E_NOVA) spawnNovaBurst(e->x + w / 2, e->y + h / 2);
-                            e->alive = 0;
-                            if (e->type == E_BOSS) {
-                                score += 10;
-                                nextBossScore += 30;
-                                bossOn = 0;
-                                spawnExplosion(e->x + 10, e->y + 10, 1);
-                                spawnExplosion(e->x + 38, e->y + 30, 1);
-                                forceSpawnItem(e->x + 10, e->y + 10);
-                                forceSpawnItem(e->x + 38, e->y + 30);
-                            } else if (e->type == E_JUGGERNAUT) {
-                                score += 4; spawnItem(e->x + w / 2, e->y + h / 2);
-                            } else if (e->type == E_TANK || e->type == E_SHIELDED || e->type == E_NOVA) {
-                                score += 3; spawnItem(e->x + w / 2, e->y + h / 2);
-                            } else if (e->type == E_SPLITTER || e->type == E_SHOOTER || e->type == E_SPINNER ||
-                                       e->type == E_STINGER || e->type == E_ORBITER || e->type == E_PHANTOM) {
-                                score += 2; spawnItem(e->x + w / 2, e->y + h / 2);
-                            } else if (e->type == E_SHARD) {
-                                score += 1;
-                            } else {
-                                score += 1; spawnItem(e->x + w / 2, e->y + h / 2);
-                            }
-                        }
-                    }
-                }
-
-                if (shieldStack > 0 && e->alive && e->type != E_BOSS) {
-                    int srad = 12 + shieldStack * 4;
-                    int ex = e->x + w / 2, ey = e->y + h / 2;
-                    int dx = ex - (px + 8), dy = ey - (py + 8);
-                    if (dx * dx + dy * dy <= srad * srad) {
-                        spawnExplosion(ex, ey, 0);
-                        spawnSparks(ex, ey, 5, 120, 220, 255, 0);
-                        e->alive = 0;
-                        score += 1;
+                    if (e->type == E_PHANTOM && e->shield == 0) {
+                        spawnSparks(bullets[j].x + 2, bullets[j].y, 3, 160, 120, 255, 0);
                         continue;
                     }
+                    if (e->type != E_PHANTOM && e->shield > 0) {
+                        e->shield--;
+                        spawnSparks(bullets[j].x + 2, bullets[j].y, 4, 100, 200, 255, 0);
+                        continue;
+                    }
+
+                    int maxPow = 0;
+                    for (int p = 0; p < MAX_PLAYERS; p++)
+                        if (players[p].active && players[p].alive && players[p].powerStack > maxPow)
+                            maxPow = players[p].powerStack;
+                    e->hp -= dmgBase + maxPow;
+
+                    spawnSparks(bullets[j].x + 2, bullets[j].y, 4, 120, 230, 255, 0);
+                    if (e->hp <= 0) {
+                        spawnExplosion(e->x + w / 2, e->y + h / 2,
+                                       e->type == E_BOSS || e->type == E_TANK || e->type == E_JUGGERNAUT);
+                        if (e->type == E_SPLITTER) spawnShards(e->x + w / 2, e->y + h / 2);
+                        if (e->type == E_NOVA) spawnNovaBurst(e->x + w / 2, e->y + h / 2);
+                        e->alive = 0;
+
+                        int pts = 1;
+                        if (e->type == E_BOSS) pts = 10;
+                        else if (e->type == E_JUGGERNAUT) pts = 4;
+                        else if (e->type == E_TANK || e->type == E_SHIELDED || e->type == E_NOVA) pts = 3;
+                        else if (e->type == E_SPLITTER || e->type == E_SHOOTER || e->type == E_SPINNER ||
+                                 e->type == E_STINGER || e->type == E_ORBITER || e->type == E_PHANTOM) pts = 2;
+
+                        int who = nearestPlayer(e->x, e->y);
+                        if (who >= 0) players[who].score += pts;
+
+                        if (e->type == E_BOSS) {
+                            nextBossScore += 30;
+                            bossOn = 0;
+                            spawnExplosion(e->x + 10, e->y + 10, 1);
+                            spawnExplosion(e->x + 38, e->y + 30, 1);
+                            forceSpawnItem(e->x + 10, e->y + 10);
+                            forceSpawnItem(e->x + 38, e->y + 30);
+                        } else if (e->type != E_SHARD) {
+                            spawnItem(e->x + w / 2, e->y + h / 2);
+                        }
+                    }
                 }
 
-                int phantomImmune = (e->type == E_PHANTOM && e->shield == 0);
-                if (e->alive && !phantomImmune && invuln == 0 && shieldStack == 0 &&
-                    overlap(px, py, 16, 16, e->x, e->y, w, h)) {
-                    spawnExplosion(e->x + w / 2, e->y + h / 2, 0);
-                    if (e->type != E_BOSS) e->alive = 0;
-                    lives--;
-                    invuln = 90;
-                    if (lives <= 0) {
-                        spawnExplosion(px + 8, py + 8, 1);
-                        awardGems(score);
-                        state = STATE_GAMEOVER;
+                if (!e->alive) continue;
+
+                for (int p = 0; p < MAX_PLAYERS; p++) {
+                    Player *pl = &players[p];
+                    if (!pl->active || !pl->alive || !e->alive) continue;
+
+                    if (pl->shieldStack > 0 && e->type != E_BOSS) {
+                        int srad = 12 + pl->shieldStack * 4;
+                        int ex = e->x + w / 2, ey = e->y + h / 2;
+                        int dx = ex - (pl->x + 8), dy = ey - (pl->y + 8);
+                        if (dx * dx + dy * dy <= srad * srad) {
+                            spawnExplosion(ex, ey, 0);
+                            spawnSparks(ex, ey, 5, 120, 220, 255, 0);
+                            if (e->type == E_NOVA) spawnNovaBurst(ex, ey);
+                            e->alive = 0;
+                            pl->score += 1;
+                            break;
+                        }
                     }
+
+                    int phantomImmune = (e->type == E_PHANTOM && e->shield == 0);
+                    if (!phantomImmune && pl->invuln == 0 && pl->shieldStack == 0 &&
+                        overlap(pl->x, pl->y, 16, 16, e->x, e->y, w, h)) {
+                        spawnExplosion(e->x + w / 2, e->y + h / 2, 0);
+                        if (e->type != E_BOSS) e->alive = 0;
+                        hurtPlayer(p);
+                    }
+                }
+            }
+
+            /* ---------- [MAD] logika boss rahasia ---------- */
+            if (mad.alive) {
+                if (mad.hit > 0) mad.hit--;
+                if (!mad.phase2 && mad.hp * 2 <= mad.maxhp && mad.state != MAD_DYING) mad.phase2 = 1;
+
+                if (mad.state == MAD_DYING) {
+                    mad.dyingT++;
+                    if (mad.dyingT % 5 == 0)
+                        spawnExplosion(mad.x + rand() % 52, mad.y + rand() % 40, 1);
+                    if (mad.dyingT == 1) {
+                        for (int k = 0; k < 6; k++)
+                            spawnSparks(mad.x + 24, mad.y + 20, 8, 255, 200, 90, 1);
+                    }
+                    if (mad.dyingT > 80) {
+                        spawnExplosion(mad.x + 24, mad.y + 20, 1);
+                        for (int k = 0; k < 4; k++) forceSpawnItem(mad.x + k * 12, mad.y + 10);
+                        for (int p = 0; p < MAX_PLAYERS; p++)
+                            if (players[p].active) players[p].score += 25;
+                        mad.alive = 0;
+                    }
+                } else {
+                    madMove();
+                    int pauseTime = mad.phase2 ? 45 : 70;
+                    if (mad.state == MAD_IDLE) {
+                        if (--mad.timer <= 0) madBeginAttack();
+                    } else if (mad.state == MAD_LOCK) {
+                        if (--mad.timer <= 0) { mad.state = MAD_DASH; mad.timer = 22; }
+                    } else if (mad.state == MAD_DASH) {
+                        int dx = mad.tx - (mad.x + 24), dy = mad.ty - (mad.y + 20);
+                        mad.x += (dx > 6 ? 6 : (dx < -6 ? -6 : 0));
+                        mad.y += (dy > 6 ? 6 : (dy < -6 ? -6 : 0));
+                        if (--mad.timer <= 0) { mad.state = MAD_IDLE; mad.timer = pauseTime; }
+                    } else if (mad.state == MAD_BOMB) {
+                        if (--mad.timer <= 0) {
+                            spawnBomb(mad.x + 24, mad.y + 30);
+                            if (mad.phase2) spawnBomb(mad.x + 10, mad.y + 30);
+                            mad.state = MAD_IDLE; mad.timer = pauseTime;
+                        }
+                    } else if (mad.state == MAD_LASER) {
+                        if (--mad.timer <= 0) {
+                            spawnMLaser(mad.x + 24, mad.y + 24, 0);   /* horizontal */
+                            spawnMLaser(mad.x + 24, mad.y + 24, 4);   /* vertikal */
+                            spawnMLaser(mad.x + 24, mad.y + 24, 2);   /* diagonal */
+                            mad.state = MAD_IDLE; mad.timer = MLASER_WARN + MLASER_FIRE + 20;
+                        }
+                    } else if (mad.state == MAD_SWARM) {
+                        int gap = mad.phase2 ? 7 : 10;
+                        if (mad.timer % gap == 0)
+                            spawnMissile(mad.x + 10 + rand() % 30, mad.y + 10, (rand() % 5) - 2, 2);
+                        if (--mad.timer <= 0) { mad.state = MAD_IDLE; mad.timer = pauseTime + 10; }
+                    } else if (mad.state == MAD_NOVA) {
+                        if (--mad.timer <= 0) {
+                            madSummonNova();
+                            mad.state = MAD_IDLE; mad.timer = pauseTime + 30;
+                        }
+                    }
+                }
+
+                for (int j = 0; j < MAX_BULLETS; j++) {
+                    if (!bullets[j].alive || mad.state == MAD_DYING) continue;
+                    if (!overlap(bullets[j].x, bullets[j].y, 4, 14, mad.x - 6, mad.y, 62, 42)) continue;
+                    bullets[j].alive = 0;
+                    int maxPow = 0;
+                    for (int p = 0; p < MAX_PLAYERS; p++)
+                        if (players[p].active && players[p].alive && players[p].powerStack > maxPow)
+                            maxPow = players[p].powerStack;
+                    mad.hp -= 1 + maxPow;
+                    mad.hit = 3;
+                    spawnSparks(bullets[j].x + 2, bullets[j].y, 3, 120, 255, 160, 0);
+                    if (mad.hp <= 0 && mad.state != MAD_DYING) {
+                        mad.state = MAD_DYING; mad.dyingT = 0;
+                        for (int i = 0; i < MAX_MISSILES; i++) missiles[i].alive = 0;
+                        for (int i = 0; i < MAX_BOMBS; i++)    mbombs[i].alive = 0;
+                        for (int i = 0; i < MAX_MLASERS; i++)  mlasers[i].alive = 0;
+                    }
+                }
+
+                if (mad.state != MAD_DYING) {
+                    for (int p = 0; p < MAX_PLAYERS; p++) {
+                        Player *pl = &players[p];
+                        if (!pl->active || !pl->alive || pl->invuln > 0 || pl->shieldStack > 0) continue;
+                        if (overlap(pl->x, pl->y, 16, 16, mad.x - 6, mad.y, 62, 42)) hurtPlayer(p);
+                    }
+                }
+            }
+
+            /* rudal hujan: punya HP, bisa ditembak atau dihindari */
+            for (int i = 0; i < MAX_MISSILES; i++) {
+                if (!missiles[i].alive) continue;
+                missiles[i].x += missiles[i].vx;
+                missiles[i].y += missiles[i].vy + 1;
+                if (missiles[i].y > SCREEN_H || missiles[i].x < -8 || missiles[i].x > SCREEN_W) {
+                    missiles[i].alive = 0; continue;
+                }
+                for (int j = 0; j < MAX_BULLETS; j++) {
+                    if (!bullets[j].alive) continue;
+                    if (!overlap(bullets[j].x, bullets[j].y, 4, 14, missiles[i].x - 3, missiles[i].y - 3, 8, 10)) continue;
+                    bullets[j].alive = 0;
+                    missiles[i].hp--;
+                    spawnSparks(missiles[i].x, missiles[i].y, 3, 255, 180, 80, 0);
+                    if (missiles[i].hp <= 0) { spawnExplosion(missiles[i].x, missiles[i].y, 0); missiles[i].alive = 0; break; }
+                }
+                if (!missiles[i].alive) continue;
+                for (int p = 0; p < MAX_PLAYERS; p++) {
+                    Player *pl = &players[p];
+                    if (!pl->active || !pl->alive) continue;
+                    if (!overlap(pl->x, pl->y, 16, 16, missiles[i].x - 3, missiles[i].y - 3, 8, 10)) continue;
+                    missiles[i].alive = 0;
+                    spawnExplosion(missiles[i].x, missiles[i].y, 0);
+                    if (pl->shieldStack == 0 && pl->invuln == 0) hurtPlayer(p);
+                    break;
+                }
+            }
+
+            /* bom: dilempar ke pemain, berkedip makin cepat, lalu meledak dengan area damage */
+            for (int i = 0; i < MAX_BOMBS; i++) {
+                if (!mbombs[i].alive) continue;
+                int t = nearestPlayer(mbombs[i].x, mbombs[i].y);
+                if (t >= 0 && mbombs[i].timer > 40) {
+                    int dx = players[t].x + 8 - mbombs[i].x, dy = players[t].y + 8 - mbombs[i].y;
+                    mbombs[i].x += (dx > 0) ? 1 : (dx < 0 ? -1 : 0);
+                    mbombs[i].y += (dy > 0) ? 1 : (dy < 0 ? -1 : 0);
+                }
+                if (--mbombs[i].timer <= 0) {
+                    spawnExplosion(mbombs[i].x, mbombs[i].y, 1);
+                    for (int p = 0; p < MAX_PLAYERS; p++) {
+                        Player *pl = &players[p];
+                        if (!pl->active || !pl->alive || pl->invuln > 0 || pl->shieldStack > 0) continue;
+                        int dx = pl->x + 8 - mbombs[i].x, dy = pl->y + 8 - mbombs[i].y;
+                        if (dx * dx + dy * dy <= 40 * 40) hurtPlayer(p);
+                    }
+                    mbombs[i].alive = 0;
+                }
+            }
+
+            /* laser boss: peringatan lalu menembak 1,8 detik, lalu hilang */
+            for (int i = 0; i < MAX_MLASERS; i++) {
+                if (!mlasers[i].alive) continue;
+                if (--mlasers[i].timer <= 0) { mlasers[i].alive = 0; continue; }
+                if (mlasers[i].timer > MLASER_FIRE) continue;
+                for (int p = 0; p < MAX_PLAYERS; p++) {
+                    Player *pl = &players[p];
+                    if (!pl->active || !pl->alive || pl->invuln > 0 || pl->shieldStack > 0) continue;
+                    if (beamHit(mlasers[i].x, mlasers[i].y, mlasers[i].angle, 260, 7, pl->x + 8, pl->y + 8))
+                        hurtPlayer(p);
                 }
             }
 
             for (int i = 0; i < MAX_EBULLETS; i++) {
                 if (!ebullets[i].alive) continue;
-                if (shieldStack > 0 &&
-                    overlap(px, py, 16, 16, ebullets[i].x, ebullets[i].y, 3, 9)) {
+                for (int p = 0; p < MAX_PLAYERS; p++) {
+                    Player *pl = &players[p];
+                    if (!pl->active || !pl->alive) continue;
+                    if (!overlap(pl->x, pl->y, 16, 16, ebullets[i].x, ebullets[i].y, 3, 9)) continue;
                     ebullets[i].alive = 0;
-                    spawnSparks(ebullets[i].x, ebullets[i].y, 3, 100, 200, 255, 0);
-                    continue;
-                }
-                if (invuln == 0 && shieldStack == 0 &&
-                    overlap(px, py, 16, 16, ebullets[i].x, ebullets[i].y, 3, 9)) {
-                    ebullets[i].alive = 0;
-                    spawnExplosion(px + 8, py + 8, 0);
-                    lives--;
-                    invuln = 90;
-                    if (lives <= 0) {
-                        spawnExplosion(px + 8, py + 8, 1);
-                        awardGems(score);
-                        state = STATE_GAMEOVER;
+                    if (pl->shieldStack > 0) {
+                        spawnSparks(ebullets[i].x, ebullets[i].y, 3, 100, 200, 255, 0);
+                    } else if (pl->invuln == 0) {
+                        hurtPlayer(p);
                     }
+                    break;
                 }
             }
 
-            /* Tabrakan laser silang Nova (hanya saat fase aktif) */
             for (int i = 0; i < MAX_NOVABURST; i++) {
                 if (!novabursts[i].alive || novabursts[i].phase != 1) continue;
-                int hit = beamHit(novabursts[i].x, novabursts[i].y, 0, 8, px + 8, py + 8) ||
-                          beamHit(novabursts[i].x, novabursts[i].y, 4, 8, px + 8, py + 8) ||
-                          beamHit(novabursts[i].x, novabursts[i].y, 2, 8, px + 8, py + 8) ||
-                          beamHit(novabursts[i].x, novabursts[i].y, 6, 8, px + 8, py + 8);
-                if (!hit || shieldStack > 0 || invuln > 0) continue;
-                spawnExplosion(px + 8, py + 8, 0);
-                lives--;
-                invuln = 90;
-                if (lives <= 0) {
-                    spawnExplosion(px + 8, py + 8, 1);
-                    awardGems(score);
-                    state = STATE_GAMEOVER;
+                for (int p = 0; p < MAX_PLAYERS; p++) {
+                    Player *pl = &players[p];
+                    if (!pl->active || !pl->alive) continue;
+                    if (pl->shieldStack > 0 || pl->invuln > 0) continue;
+                    int cx = pl->x + 8, cy = pl->y + 8;
+                    int hit = beamHit(novabursts[i].x, novabursts[i].y, 0, NOVA_LEN, 8, cx, cy) ||
+                              beamHit(novabursts[i].x, novabursts[i].y, 4, NOVA_LEN, 8, cx, cy) ||
+                              beamHit(novabursts[i].x, novabursts[i].y, 2, NOVA_LEN, 8, cx, cy) ||
+                              beamHit(novabursts[i].x, novabursts[i].y, 6, NOVA_LEN, 8, cx, cy);
+                    if (hit) hurtPlayer(p);
                 }
             }
 
             for (int i = 0; i < MAX_ITEMS; i++) {
                 if (!items[i].alive) continue;
-                if (overlap(px, py, 16, 16, items[i].x, items[i].y, 10, 10)) {
-                    applyItem(items[i].type, &lives);
-                    spawnSparks(items[i].x + 5, items[i].y + 5, 5, 200, 255, 200, 0);
-                    items[i].alive = 0;
+                for (int p = 0; p < MAX_PLAYERS; p++) {
+                    Player *pl = &players[p];
+                    if (!pl->active || !pl->alive) continue;
+                    if (overlap(pl->x, pl->y, 16, 16, items[i].x, items[i].y, 10, 10)) {
+                        applyItem(pl, items[i].type);
+                        spawnSparks(items[i].x + 5, items[i].y + 5, 5, 200, 255, 200, 0);
+                        items[i].alive = 0;
+                        break;
+                    }
                 }
+            }
+
+            if (countAlive() == 0) {
+                awardGems(totalScore());
+                state = STATE_GAMEOVER;
             }
         } else if (state == STATE_GACHA) {
             if (gachaFlashT > 0) gachaFlashT--;
-            if (pressed(btn, PAD_CROSS) && gachaFlashT == 0) { if (doGachaPull()) gachaFlashT = 20; }
-            if (pressed(btn, PAD_CIRCLE)) state = STATE_MENU;
+            if (connected[0] && pressedP(0, btn[0], PAD_CROSS) && gachaFlashT == 0) {
+                if (doGachaPull()) gachaFlashT = 20;
+            }
+            if (connected[0] && pressedP(0, btn[0], PAD_CIRCLE)) state = STATE_MENU;
         } else if (state == STATE_SKINSELECT) {
-            if (pressed(btn, PAD_LEFT))  skinCursor = (skinCursor + NUM_SKINS - 1) % NUM_SKINS;
-            if (pressed(btn, PAD_RIGHT)) skinCursor = (skinCursor + 1) % NUM_SKINS;
-            if (pressed(btn, PAD_CROSS) && (unlockedMask & (1u << skinCursor))) currentSkin = skinCursor;
-            if (pressed(btn, PAD_CIRCLE)) state = STATE_MENU;
+            if (connected[0]) {
+                if (pressedP(0, btn[0], PAD_LEFT))  skinCursor = (skinCursor + NUM_SKINS - 1) % NUM_SKINS;
+                if (pressedP(0, btn[0], PAD_RIGHT)) skinCursor = (skinCursor + 1) % NUM_SKINS;
+                if (pressedP(0, btn[0], PAD_CROSS) && (unlockedMask & (1u << skinCursor)))
+                    players[0].skin = skinCursor;
+                if (pressedP(0, btn[0], PAD_CIRCLE)) state = STATE_MENU;
+            }
         } else {
-            if (pressed(btn, PAD_START)) state = STATE_MENU;
+            for (int p = 0; p < MAX_PLAYERS; p++) {
+                if (connected[p] && pressedP(p, btn[p], PAD_START)) {
+                    for (int q = 0; q < MAX_PLAYERS; q++) {
+                        players[q].active = 0;
+                        players[q].alive = 0;
+                    }
+                    state = STATE_MENU;
+                    break;
+                }
+            }
         }
 
         /* ---------- Gambar ---------- */
@@ -1432,7 +1945,7 @@ int main(void) {
         drawShootingStar();
 
         if (state == STATE_MENU) {
-            drawMenu(frame);
+            drawMenu(frame, countActive());
         } else if (state == STATE_GACHA) {
             drawGachaScreen(frame);
         } else if (state == STATE_SKINSELECT) {
@@ -1453,10 +1966,58 @@ int main(void) {
             for (int i = 0; i < MAX_ITEMS; i++)
                 if (items[i].alive) drawItem(&items[i], frame);
 
+            /* [MAD] gambar boss rahasia dan serangannya */
+            if (mad.alive) {
+                if (mad.state != MAD_DYING || (frame & 2))
+                    drawMadCruiser(mad.x, mad.y, frame, mad.hit);
+                if (mad.state != MAD_DYING) {
+                    int w = mad.hp * 60 / mad.maxhp;
+                    if (w < 0) w = 0;
+                    if (w > 60) w = 60;
+                    rect(L_FX, mad.x - 6, mad.y - 12, 60, 4, 50, 10, 10);
+                    rect(L_FX, mad.x - 6, mad.y - 12, w, 4, mad.phase2 ? 255 : 80, mad.phase2 ? 120 : 255, 140);
+                }
+                if (mad.state == MAD_LOCK && (frame & 2)) {
+                    beamQuad(L_FX, (mad.x + 24 + mad.tx) / 2, (mad.y + 20 + mad.ty) / 2, 4, 120, 2, 255, 60, 60, 0);
+                    disc(L_FX, mad.tx, mad.ty, 10, 255, 60, 60, 120, 0, 0);
+                    discLo(L_FX, mad.tx, mad.ty, 5, 255, 220, 220, 255, 80, 80);
+                }
+            }
+            for (int i = 0; i < MAX_MISSILES; i++) {
+                if (!missiles[i].alive) continue;
+                glowDisc(missiles[i].x, missiles[i].y, 5, 255, 140, 60, 8);
+                tri(L_BULLET, missiles[i].x, missiles[i].y + 6, 255, 220, 160,
+                              missiles[i].x - 3, missiles[i].y - 4, 200, 60, 40,
+                              missiles[i].x + 3, missiles[i].y - 4, 200, 60, 40);
+            }
+            for (int i = 0; i < MAX_BOMBS; i++) {
+                if (!mbombs[i].alive) continue;
+                int rate = 2 + (100 - mbombs[i].timer) / 12;   /* makin cepat kedipnya */
+                int on = (frame % (rate + 1)) < 2;
+                int v = on ? 255 : 90;
+                disc(L_BULLET, mbombs[i].x, mbombs[i].y, 7, v, v / 3, 40, 80, 10, 10);
+                if (mbombs[i].timer < 40)
+                    discLo(L_FX, mbombs[i].x, mbombs[i].y, 40, 255, 60, 30, 90, 0, 0);
+            }
+            for (int i = 0; i < MAX_MLASERS; i++) {
+                if (!mlasers[i].alive) continue;
+                if (mlasers[i].timer > MLASER_FIRE) {
+                    if (frame & 2) beamQuad(L_FX, mlasers[i].x, mlasers[i].y, mlasers[i].angle, 260, 2, 255, 80, 80, 0);
+                } else {
+                    beamQuad(L_FX, mlasers[i].x, mlasers[i].y, mlasers[i].angle, 260, 12, 120, 255, 200, 0);
+                    beamQuad(L_FX, mlasers[i].x, mlasers[i].y, mlasers[i].angle, 260, 5,  255, 255, 255, 0);
+                }
+            }
+
             if (state == STATE_PLAY) {
-                drawShieldAura(px, py, frame);
-                if (invuln == 0 || (frame / 4) % 2 == 0)
-                    drawPlayer(px, py, frame, currentSkin);
+                for (int p = 0; p < MAX_PLAYERS; p++) {
+                    const Player *pl = &players[p];
+                    if (!pl->active || !pl->alive) continue;
+                    drawShieldAura(pl, frame);
+                    if (pl->invuln == 0 || (frame / 4) % 2 == 0)
+                        drawPlayer(pl->x, pl->y, frame, pl->skin);
+                    drawPlayerTag(p, pl->x, pl->y);
+                }
             }
 
             for (int i = 0; i < MAX_EXPLOSIONS; i++)
@@ -1465,14 +2026,28 @@ int main(void) {
             for (int i = 0; i < MAX_SPARKS; i++)
                 if (sparks[i].alive) drawSpark(&sparks[i]);
 
-            drawHUD(lives, level);
+            drawHUD(level);
             if (state == STATE_PLAY) drawActiveBuffs();
         }
 
+        /* ---------- Teks ---------- */
         if (state == STATE_MENU) {
-            FntPrint(-1, "\n\n\n   SPACE SHOOTER\n\n\n\n\n\n\n\n\n\n\n\n\n\n   PRESS START\n   SELECT=GACHA  SQUARE=SKIN\n   GEMS %d", gems);
+            int n = countActive();
+            char line[3][40];
+            int lineUsed = 0;
+            for (int p = 1; p < MAX_PLAYERS && lineUsed < 3; p++) {
+                if (connected[p] && !players[p].active) {
+                    snprintf(line[lineUsed], sizeof(line[0]), "   %dP PRESS START TO JOIN", p + 1);
+                    lineUsed++;
+                }
+            }
+            FntPrint(-1, "\n\n\n   SPACE SHOOTER\n\n\n\n\n\n\n\n\n\n\n\n\n");
+            if (n == 0) FntPrint(-1, "   1P PRESS START TO JOIN\n");
+            else        FntPrint(-1, "   %d PLAYER%s  X = MULAI\n", n, n > 1 ? "S" : "");
+            for (int i = 0; i < lineUsed; i++) FntPrint(-1, "%s\n", line[i]);
+            FntPrint(-1, "   SELECT=GACHA  SQUARE=SKIN   GEMS %d", gems);
         } else if (state == STATE_PLAY) {
-            FntPrint(-1, "SCORE %d   GEMS %d", score, gems);
+            FntPrint(-1, "TOTAL %d  GEMS %d", totalScore(), gems);
         } else if (state == STATE_GACHA) {
             if (gachaFlashT > 0) {
                 FntPrint(-1, "\n\n\n\n\n\n\n\n\n\n\n\n      %s%s",
@@ -1482,17 +2057,17 @@ int main(void) {
                 FntPrint(-1, "GEMS %d\n\n\n\n\n\n\n\n\n\n\n    X = PULL (%d GEMS)\n    O = KEMBALI", gems, GACHA_COST);
             }
         } else if (state == STATE_SKINSELECT) {
-            FntPrint(-1, "PILIH SKIN\n\n\n\n\n\n\n\n\n\n\n\n    %s%s\n    O = KEMBALI",
+            FntPrint(-1, "PILIH SKIN (P1)\n\n\n\n\n\n\n\n\n\n\n\n    %s%s\n    O = KEMBALI",
                      skinTable[skinCursor].name,
                      (unlockedMask & (1u << skinCursor)) ? "" : " (TERKUNCI)");
         } else {
-            FntPrint(-1, "SCORE %d\n\n\n\n\n\n\n\n    GAME OVER\n\n    FINAL %d\n\n\n    PRESS START", score, score);
+            FntPrint(-1, "TOTAL %d\n\n\n\n\n\n\n    GAME OVER\n\n    FINAL %d\n\n\n    PRESS START", totalScore(), totalScore());
         }
         FntFlush(-1);
 
         setBlendMode(L_GLOW, 1);
         flip();
-        prevBtn = btn;
+        for (int p = 0; p < MAX_PLAYERS; p++) prevBtn[p] = btn[p];
         frame++;
     }
 

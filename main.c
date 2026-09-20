@@ -5,7 +5,7 @@
 #include <psxpad.h>
 #include <psxapi.h>
 
-#define OT_LEN     8
+#define OT_LEN     9
 #define BUFFER_LEN 98304
 #define SCREEN_W   320
 #define SCREEN_H   240
@@ -24,15 +24,21 @@ static uint8_t      padbuf[2][34];
 
 /* DrawOTag menggambar dari index TINGGI ke RENDAH.
    Index tinggi = digambar duluan = paling BELAKANG.
-   Dalam satu layer, primitif yang ditambahkan BELAKANGAN digambar DULUAN. */
-enum { L_HUD_TOP = 0, L_HUD_BASE = 1, L_FX = 2, L_PLAYER = 3, L_BULLET = 4,
-       L_ENEMY = 5, L_PLANET = 6, L_BG = 7 };
+   Dalam satu layer, primitif yang ditambahkan BELAKANGAN digambar DULUAN.
+
+   L_GLOW adalah layer khusus semi-transparency (additive blend).
+   Primitif di layer ini WAJIB ditambahkan lewat glowDisc(), dan
+   setBlendMode(L_GLOW, 1) HARUS dipanggil PALING TERAKHIR tiap frame
+   (persis sebelum flip()) supaya mode blend aktif sebelum GPU
+   memproses primitif glow di layer itu. */
+enum { L_HUD_TOP = 0, L_HUD_BASE = 1, L_GLOW = 2, L_FX = 3, L_PLAYER = 4,
+       L_BULLET = 5, L_ENEMY = 6, L_PLANET = 7, L_BG = 8 };
 
 typedef struct { int x, y, alive, hp, type, t; } Enemy;
 typedef struct { int x, y, alive, dx; } Bullet;
 typedef struct { int x, y, alive, timer, big; } Explosion;
 typedef struct { int x, y, vx, vy, life, maxlife, r, g, b, alive, size; } Spark;
-typedef struct { int x, y, speed; } Star;
+typedef struct { int x, y, speed, layer, phase; } Star;
 
 #define MAX_BULLETS    16
 #define MAX_ENEMIES    10
@@ -53,6 +59,8 @@ static Enemy     enemies[MAX_ENEMIES];
 static Explosion explosions[MAX_EXPLOSIONS];
 static Spark     sparks[MAX_SPARKS];
 static Star      stars[NUM_STARS];
+
+static int shootX = -100, shootY = 0, shootT = 0;
 
 /* Sin/cos 16 langkah (skala 0..127), untuk lingkaran dan gerak */
 static const int8_t sin16[16] = {
@@ -101,7 +109,7 @@ static void flip(void) {
     nextpri = buffers[active].buf;
 }
 
-/* ---------- Primitif ---------- */
+/* ---------- Primitif dasar ---------- */
 
 static int clamp255(int v) { return v < 0 ? 0 : (v > 255 ? 255 : v); }
 
@@ -143,8 +151,22 @@ static void rectGradV(int layer, int x, int y, int w, int h,
     nextpri += sizeof(POLY_G4);
 }
 
-/* Lingkaran 16 sisi: pusat warna (cr,cg,cb), tepi warna (er,eg,eb).
-   Ini yang bikin bola/glow terlihat halus, bukan kotak. */
+/* Ganti mode blending GPU untuk sebuah layer.
+   mode 0 = (B+F)/2  -> transparan lembut, cocok panel kaca
+   mode 1 = B+F      -> aditif terang, cocok glow/neon/api
+   mode 2 = B-F      -> jarang dipakai (invert)
+   mode 3 = B+F/4    -> aditif halus, cocok kabut/atmosfer
+   CATATAN: nama fungsi setDrawMode/getTPage & urutan parameter bisa
+   sedikit beda antar versi PSn00bSDK. Kalau gagal compile, cek
+   psxgpu.h yang terpasang dan sesuaikan. */
+static void setBlendMode(int layer, int mode) {
+    DR_MODE *p = (DR_MODE *)nextpri;
+    setDrawMode(p, 0, 0, getTPage(0, mode, 0, 0), NULL);
+    addPrim(&buffers[active].ot[layer], p);
+    nextpri += sizeof(DR_MODE);
+}
+
+/* Lingkaran solid 16 sisi (halus, dipakai untuk objek besar: planet, kilau) */
 static void disc(int layer, int cx, int cy, int rad,
                  int cr, int cg, int cb, int er, int eg, int eb) {
     for (int i = 0; i < 16; i++) {
@@ -156,7 +178,42 @@ static void disc(int layer, int cx, int cy, int rad,
     }
 }
 
-/* Bintang bergerigi (untuk ledakan): 8 ujung panjang bergantian pendek */
+/* Lingkaran solid 8 sisi (murah, dipakai objek kecil: bintang, titik indikator) */
+static void discLo(int layer, int cx, int cy, int rad,
+                   int cr, int cg, int cb, int er, int eg, int eb) {
+    for (int i = 0; i < 16; i += 2) {
+        int x1 = cx + cosI(i)     * rad / 127;
+        int y1 = cy + sinI(i)     * rad / 127;
+        int x2 = cx + cosI(i + 2) * rad / 127;
+        int y2 = cy + sinI(i + 2) * rad / 127;
+        tri(layer, cx, cy, cr, cg, cb, x1, y1, er, eg, eb, x2, y2, er, eg, eb);
+    }
+}
+
+/* Lingkaran GLOW: 8 segitiga semi-transparan aditif, pusat terang -> tepi
+   memudar ke hitam. Digabung sama setBlendMode(L_GLOW,1) hasilnya jadi
+   cahaya neon lembut, jauh lebih murah & lebih bagus dari disc() gradient
+   biasa. Selalu masuk ke layer L_GLOW. */
+static void glowDisc(int cx, int cy, int rad, int r, int g, int b, int sides) {
+    int step = 16 / sides; if (step < 1) step = 1;
+    for (int i = 0; i < 16; i += step) {
+        int x1 = cx + cosI(i)        * rad / 127;
+        int y1 = cy + sinI(i)        * rad / 127;
+        int x2 = cx + cosI(i + step) * rad / 127;
+        int y2 = cy + sinI(i + step) * rad / 127;
+        POLY_G3 *p = (POLY_G3 *)nextpri;
+        setPolyG3(p);
+        setSemiTrans(p, 1);
+        setXY3(p, cx, cy, x1, y1, x2, y2);
+        setRGB0(p, clamp255(r), clamp255(g), clamp255(b));
+        setRGB1(p, 0, 0, 0);
+        setRGB2(p, 0, 0, 0);
+        addPrim(&buffers[active].ot[L_GLOW], p);
+        nextpri += sizeof(POLY_G3);
+    }
+}
+
+/* Bintang bergerigi (untuk ledakan) */
 static void burst(int layer, int cx, int cy, int rOut, int rIn, int rot,
                   int cr, int cg, int cb, int er, int eg, int eb) {
     for (int i = 0; i < 8; i++) {
@@ -173,33 +230,137 @@ static void burst(int layer, int cx, int cy, int rOut, int rIn, int rot,
     }
 }
 
+/* ---------- UI melengkung (rounded panel / glassmorphism) ---------- */
+
+static void flatRect(int layer, int x, int y, int w, int h,
+                     int r, int g, int b, int trans) {
+    POLY_F4 *p = (POLY_F4 *)nextpri;
+    setPolyF4(p);
+    if (trans) setSemiTrans(p, 1);
+    setXY4(p, x, y, x + w, y, x, y + h, x + w, y + h);
+    setRGB0(p, clamp255(r), clamp255(g), clamp255(b));
+    addPrim(&buffers[active].ot[layer], p);
+    nextpri += sizeof(POLY_F4);
+}
+
+/* q = kuadran (0..3). Kalau arahnya kebalik pas dites, tukar angka q
+   di pemanggilan roundedPanel() sampai sudutnya pas. */
+static void quarterDisc(int layer, int cx, int cy, int rad, int q,
+                        int r, int g, int b, int trans) {
+    int base = q * 4;
+    for (int i = 0; i < 4; i++) {
+        int x1 = cx + cosI(base + i)     * rad / 127;
+        int y1 = cy + sinI(base + i)     * rad / 127;
+        int x2 = cx + cosI(base + i + 1) * rad / 127;
+        int y2 = cy + sinI(base + i + 1) * rad / 127;
+        POLY_G3 *p = (POLY_G3 *)nextpri;
+        setPolyG3(p);
+        if (trans) setSemiTrans(p, 1);
+        setXY3(p, cx, cy, x1, y1, x2, y2);
+        setRGB0(p, clamp255(r), clamp255(g), clamp255(b));
+        setRGB1(p, clamp255(r), clamp255(g), clamp255(b));
+        setRGB2(p, clamp255(r), clamp255(g), clamp255(b));
+        addPrim(&buffers[active].ot[layer], p);
+        nextpri += sizeof(POLY_G3);
+    }
+}
+
+static void roundedPanel(int layer, int x, int y, int w, int h, int rad,
+                         int r, int g, int b, int trans) {
+    flatRect(layer, x + rad, y, w - 2 * rad, h, r, g, b, trans);
+    flatRect(layer, x, y + rad, rad, h - 2 * rad, r, g, b, trans);
+    flatRect(layer, x + w - rad, y + rad, rad, h - 2 * rad, r, g, b, trans);
+    quarterDisc(layer, x + rad,       y + rad,       rad, 2, r, g, b, trans);
+    quarterDisc(layer, x + w - rad,   y + rad,       rad, 3, r, g, b, trans);
+    quarterDisc(layer, x + rad,       y + h - rad,   rad, 1, r, g, b, trans);
+    quarterDisc(layer, x + w - rad,   y + h - rad,   rad, 0, r, g, b, trans);
+}
+
+/* ---------- Planet dengan pencahayaan semu (fake sphere lighting) ---------- */
+
+static void planetSphere(int cx, int cy, int rad,
+                         int litR, int litG, int litB,
+                         int darkR, int darkG, int darkB) {
+    for (int i = 0; i < 16; i++) {
+        int x1 = cx + cosI(i)     * rad / 127;
+        int y1 = cy + sinI(i)     * rad / 127;
+        int x2 = cx + cosI(i + 1) * rad / 127;
+        int y2 = cy + sinI(i + 1) * rad / 127;
+        int litAmt = cosI(i) + 127; /* 0..254: terang di satu sisi, gelap di sisi lain */
+        int r = darkR + (litR - darkR) * litAmt / 254;
+        int g = darkG + (litG - darkG) * litAmt / 254;
+        int b = darkB + (litB - darkB) * litAmt / 254;
+        tri(L_PLANET, cx, cy, r, g, b,
+                      x1, y1, r / 3, g / 3, b / 3,
+                      x2, y2, r / 3, g / 3, b / 3);
+    }
+    /* atmosfer tipis mengikuti sisi terang */
+    glowDisc(cx - rad / 4, cy - rad / 4, rad + 6, litR, litG, litB, 8);
+}
+
+/* ---------- Starfield: parallax 3 lapis + kelip + shooting star ---------- */
+
+static void initStars(void) {
+    for (int i = 0; i < NUM_STARS; i++) {
+        stars[i].x = rand() % SCREEN_W;
+        stars[i].y = rand() % SCREEN_H;
+        stars[i].layer = i % 3;
+        stars[i].speed = 1 + stars[i].layer;
+        stars[i].phase = rand() % 32;
+    }
+}
+
+static void drawStars(int frame) {
+    for (int i = 0; i < NUM_STARS; i++) {
+        int tw   = 140 + sinS(frame + stars[i].phase) / 2;
+        int rad  = stars[i].layer + 1;
+        int tint = (stars[i].layer == 2) ? 40 : 0;
+        discLo(L_PLANET, stars[i].x, stars[i].y, rad,
+               tw, tw, tw + tint, tw / 3, tw / 3, tw / 3);
+    }
+}
+
+static void updateShootingStar(int frame) {
+    if (shootT <= 0 && frame % 180 == 0) {
+        shootX = rand() % (SCREEN_W - 60);
+        shootY = HUD_H;
+        shootT = 20;
+    }
+    if (shootT > 0) {
+        shootX += 6;
+        shootY += 4;
+        shootT--;
+    }
+}
+
+static void drawShootingStar(void) {
+    if (shootT <= 0) return;
+    glowDisc(shootX, shootY, 3, 255, 255, 255, 8);
+    tri(L_PLANET, shootX, shootY, 255, 255, 255,
+                  shootX - 14, shootY - 9, 0, 0, 0,
+                  shootX - 2, shootY - 1, 120, 120, 160);
+}
+
 /* ---------- Latar ---------- */
 
 static void drawBackground(int frame) {
-    /* PENTING: yang ditambah PALING AKHIR di layer yang sama digambar
-       PALING AWAL. Jadi gradasi langit ditambah terakhir agar jadi dasar. */
-
-    /* Planet besar bergradasi dengan cincin, melintas pelan */
     int py = (frame / 5) % (SCREEN_H + 140) - 70;
     int px = 250;
-    /* Cincin (digambar setelah bola supaya tampak di depan) */
+
     tri(L_PLANET, px - 48, py + 3, 210, 180, 230,  px + 48, py - 3, 210, 180, 230,  px, py + 10, 100, 70, 140);
     tri(L_PLANET, px - 48, py + 3, 210, 180, 230,  px + 48, py - 3, 210, 180, 230,  px, py - 8, 150, 120, 190);
-    disc(L_PLANET, px, py, 30, 255, 200, 120, 120, 40, 20);
-    disc(L_PLANET, px - 8, py - 8, 12, 255, 240, 200, 255, 200, 120);   /* kilau */
+    planetSphere(px, py, 30, 255, 210, 150, 40, 25, 60);
+    disc(L_PLANET, px - 8, py - 8, 12, 255, 240, 200, 255, 200, 120);
 
-    /* Planet kecil biru */
     int py2 = (frame / 8 + 100) % (SCREEN_H + 80) - 40;
-    disc(L_PLANET, 40, py2, 14, 190, 240, 255, 20, 70, 160);
+    planetSphere(40, py2, 14, 220, 245, 255, 20, 50, 120);
 
-    /* Nebula lembut: beberapa lingkaran besar samar bertumpuk */
     int pulse = 14 + sinS(frame / 6) / 14;
     disc(L_BG, 70, 80, 70,  pulse + 40, 10, pulse + 60,  16, 6, 34);
     disc(L_BG, 110, 60, 50, pulse + 50, 20, pulse + 70,  16, 6, 34);
     disc(L_BG, 260, 160, 70, 8, pulse + 45, pulse + 55,  6, 10, 34);
     disc(L_BG, 230, 180, 50, 12, pulse + 55, pulse + 60, 6, 10, 34);
 
-    /* Dasar langit (ditambah paling akhir = digambar paling awal) */
     rectGradV(L_BG, 0, 0, SCREEN_W, SCREEN_H / 2, 20, 6, 44, 6, 8, 38);
     rectGradV(L_BG, 0, SCREEN_H / 2, SCREEN_W, SCREEN_H / 2, 6, 8, 38, 2, 4, 20);
 }
@@ -208,25 +369,21 @@ static void drawBackground(int frame) {
 
 static void drawPlayer(int x, int y, int frame) {
     int cx = x + 8;
+    int fl = 4 + (frame / 2) % 4;
 
-    /* Glow mesin */
-    int fl = 6 + (frame / 2) % 5;
-    disc(L_PLAYER, cx - 4, y + 18, 5, 255, 220, 120, 60, 20, 0);
-    disc(L_PLAYER, cx + 4, y + 18, 5, 255, 220, 120, 60, 20, 0);
+    glowDisc(cx - 4, y + 18, 4 + fl / 2, 255, 150, 40, 8);
+    glowDisc(cx + 4, y + 18, 4 + fl / 2, 255, 150, 40, 8);
     tri(L_PLAYER, cx - 5, y + 16, 255, 255, 220,  cx - 2, y + 16, 255, 255, 220,  cx - 4, y + 16 + fl, 255, 60, 0);
     tri(L_PLAYER, cx + 2, y + 16, 255, 255, 220,  cx + 5, y + 16, 255, 255, 220,  cx + 4, y + 16 + fl, 255, 60, 0);
 
-    /* Sayap */
     tri(L_PLAYER, cx - 3, y + 4,  90, 200, 255,  x - 8,  y + 18, 20, 60, 200,  cx - 3, y + 15, 30, 100, 230);
     tri(L_PLAYER, cx + 3, y + 4,  90, 200, 255,  x + 24, y + 18, 20, 60, 200,  cx + 3, y + 15, 30, 100, 230);
     rect(L_PLAYER, x - 8,  y + 16, 3, 3, 255, 240, 80);
     rect(L_PLAYER, x + 21, y + 16, 3, 3, 255, 240, 80);
 
-    /* Badan */
     tri(L_PLAYER, cx, y - 4, 255, 255, 255,  cx - 6, y + 16, 60, 120, 230,  cx + 6, y + 16, 60, 120, 230);
     rect(L_PLAYER, cx - 1, y + 6, 3, 8, 255, 150, 30);
 
-    /* Kokpit */
     tri(L_PLAYER, cx, y + 1, 220, 255, 255,  cx - 3, y + 9, 40, 160, 230,  cx + 3, y + 9, 40, 160, 230);
 }
 
@@ -238,22 +395,22 @@ static void drawEnemy(const Enemy *e, int frame) {
 
     switch (e->type) {
     case E_DRONE:
-        disc(L_ENEMY, cx, y + 4, 4, glow, glow / 2, 0, 80, 0, 0);
+        glowDisc(cx, y + 4, 4, glow, glow / 2, 0, 8);
         tri(L_ENEMY, x - 3,  y,      200, 40, 60,   x + 6,  y + 6,  120, 10, 40,  x + 4,  y + 13, 160, 20, 60);
         tri(L_ENEMY, x + 19, y,      200, 40, 60,   x + 10, y + 6,  120, 10, 40,  x + 12, y + 13, 160, 20, 60);
         tri(L_ENEMY, cx,     y + 17, 255, 140, 140, cx - 7, y,      170, 25, 60,  cx + 7, y,      170, 25, 60);
         break;
 
     case E_ZIGZAG:
-        disc(L_ENEMY, cx, y + 5, 4, 255, 255, 120, 20, 120, 40);
+        glowDisc(cx, y + 5, 4, 255, 255, 120, 8);
         tri(L_ENEMY, x - 4,  y + 4,  60, 255, 140,  x + 6,  y + 2,  10, 120, 60,  x + 6,  y + 12, 20, 160, 90);
         tri(L_ENEMY, x + 20, y + 4,  60, 255, 140,  x + 10, y + 2,  10, 120, 60,  x + 10, y + 12, 20, 160, 90);
         tri(L_ENEMY, cx,     y + 18, 200, 255, 220, cx - 6, y,      30, 190, 110, cx + 6, y,      30, 190, 110);
         break;
 
     case E_TANK:
-        disc(L_ENEMY, cx - 3, y + 7, 3, glow, 60, glow, 60, 0, 60);
-        disc(L_ENEMY, cx + 4, y + 7, 3, glow, 60, glow, 60, 0, 60);
+        glowDisc(cx - 3, y + 7, 3, glow, 60, glow, 8);
+        glowDisc(cx + 4, y + 7, 3, glow, 60, glow, 8);
         tri(L_ENEMY, x - 6,  y + 2,  190, 100, 255, x + 8,  y + 8,  90, 40, 160, x + 4,  y + 18, 120, 60, 200);
         tri(L_ENEMY, x + 22, y + 2,  190, 100, 255, x + 8,  y + 8,  90, 40, 160, x + 12, y + 18, 120, 60, 200);
         tri(L_ENEMY, cx,     y + 22, 230, 180, 255, cx - 10, y,     110, 50, 190, cx + 10, y,     110, 50, 190);
@@ -261,14 +418,13 @@ static void drawEnemy(const Enemy *e, int frame) {
 
     case E_BOSS: {
         int bx = x, by = y;
-        /* Bar nyawa */
         rect(L_FX, bx - 6, by - 8, 60, 4, 50, 10, 10);
         int w = e->hp * 60 / 30;
         if (w < 0) w = 0;
         rect(L_FX, bx - 6, by - 8, w, 4, 255, 60, 60);
 
-        disc(L_ENEMY, bx + 19, by + 15, 5, glow, 40, 0, 90, 0, 0);
-        disc(L_ENEMY, bx + 29, by + 15, 5, glow, 40, 0, 90, 0, 0);
+        glowDisc(bx + 19, by + 15, 5, glow, 40, 0, 8);
+        glowDisc(bx + 29, by + 15, 5, glow, 40, 0, 8);
         tri(L_ENEMY, bx - 16, by + 8,  255, 140, 30, bx + 16, by + 14, 150, 40, 10, bx + 10, by + 34, 200, 70, 20);
         tri(L_ENEMY, bx + 64, by + 8,  255, 140, 30, bx + 32, by + 14, 150, 40, 10, bx + 38, by + 34, 200, 70, 20);
         tri(L_ENEMY, bx + 24, by + 44, 255, 220, 120, bx,      by,      170, 50, 20, bx + 48, by,      170, 50, 20);
@@ -277,28 +433,24 @@ static void drawEnemy(const Enemy *e, int frame) {
     }
 }
 
-/* ---------- Laser: inti terang dengan glow bulat ---------- */
+/* ---------- Laser ---------- */
 
 static void drawLaser(int x, int y, int frame) {
-    int fl = ((frame / 2) & 1) * 30;
-    /* Glow bulat besar di ujung dan pangkal */
-    disc(L_BULLET, x + 2, y + 2,  8, 60 + fl, 200, 255, 0, 20, 80);
-    disc(L_BULLET, x + 2, y + 12, 6, 30, 140 + fl, 255, 0, 10, 60);
-    /* Inti memanjang */
+    int fl = ((frame / 2) & 1) * 20;
+    glowDisc(x + 2, y + 4, 7, 80 + fl, 200, 255, 8);
     rect(L_BULLET, x,     y - 2, 4, 18, 255, 255, 255);
     rect(L_BULLET, x + 1, y - 5, 2, 4,  255, 255, 255);
 }
 
-/* ---------- Ledakan: bola api + bintang bergerigi + gelombang ---------- */
+/* ---------- Ledakan ---------- */
 
 static void drawExplosion(const Explosion *e) {
-    int t     = EXPLOSION_LEN - e->timer;         /* 0..LEN */
+    int t     = EXPLOSION_LEN - e->timer;
     int grow  = e->big ? 3 : 2;
     int rad   = 4 + t * grow;
     int fade  = e->timer * 255 / EXPLOSION_LEN;
     int x = e->x, y = e->y;
 
-    /* Gelombang kejut: cincin tipis yang melebar (segitiga tepi-tepi) */
     if (t > 2) {
         int rw = rad + 6;
         for (int i = 0; i < 16; i += 2) {
@@ -314,18 +466,14 @@ static void drawExplosion(const Explosion *e) {
         }
     }
 
-    /* Bintang bergerigi berputar (api meletup) */
     burst(L_FX, x, y, rad + 6, rad / 2, t / 2,
           255, 230, 120, fade, fade / 3, 0);
 
-    /* Bola api bulat: pusat putih-kuning, tepi oranye-merah */
-    disc(L_FX, x, y, rad,
-         255, 255, 200, fade, fade / 2, 0);
+    disc(L_FX, x, y, rad, 255, 255, 200, fade, fade / 2, 0);
     if (rad > 8)
-        disc(L_FX, x, y, rad / 2, 255, 255, 255, 255, 220, 100);
+        glowDisc(x, y, rad / 2, 255, 255, 255, 8);
 }
 
-/* Puing/percikan: berbentuk bintik yang memanjang searah gerak */
 static void drawSpark(const Spark *s) {
     int fade = s->life * 255 / s->maxlife;
     int px = s->x >> 4, py = s->y >> 4;
@@ -333,11 +481,9 @@ static void drawSpark(const Spark *s) {
     int vx = s->vx >> 4, vy = s->vy >> 4;
     int r = s->r * fade / 255, g = s->g * fade / 255, b = s->b * fade / 255;
 
-    /* Jejak: segitiga tipis dari titik sekarang ke arah belakang gerak */
     tri(L_FX, px, py, r, g, b,
               px - vx * len, py - vy * len, 0, 0, 0,
               px + 1, py + 1, r / 2, g / 2, b / 2);
-    /* Kepala terang */
     rect(L_FX, px - 1, py - 1, 2 + s->size / 2, 2 + s->size / 2,
          r + 40, g + 40, b + 40);
 }
@@ -375,7 +521,6 @@ static void spawnExplosion(int x, int y, int big) {
 /* ---------- HUD ---------- */
 
 static void drawHUD(int lives, int level) {
-    /* L_HUD_TOP (0) digambar TERAKHIR = paling depan: ikon dan bar. */
     for (int i = 0; i < START_LIVES; i++) {
         int lx = SCREEN_W - 26 - i * 18;
         if (i < lives) {
@@ -387,28 +532,25 @@ static void drawHUD(int lives, int level) {
     }
 
     for (int i = 0; i < 10; i++) {
-        if (i < level)
-            rect(L_HUD_TOP, 8 + i * 9, 25, 7, 3, 0, 230, 140);
-        else
-            rect(L_HUD_TOP, 8 + i * 9, 25, 7, 3, 30, 40, 60);
+        int cx = 10 + i * 9;
+        if (i < level) glowDisc(cx, 26, 3, 0, 230, 140, 8);
+        else           discLo(L_HUD_TOP, cx, 26, 2, 30, 40, 60, 20, 25, 40);
     }
 
-    /* L_HUD_BASE (1) digambar SEBELUM HUD_TOP = panel di belakang ikon. */
-    rect(L_HUD_BASE, 0, HUD_H, SCREEN_W, 1, 60, 140, 255);
-    rectGradV(L_HUD_BASE, 0, 0, SCREEN_W, HUD_H, 10, 22, 56, 2, 4, 20);
+    roundedPanel(L_HUD_BASE, 0, 0, SCREEN_W, HUD_H, 10, 20, 40, 90, 1);
+    rect(L_HUD_BASE, 0, HUD_H, SCREEN_W, 1, 90, 170, 255);
+    setBlendMode(L_HUD_BASE, 0);
 }
 
 /* ---------- Main menu ---------- */
 
 static void drawMenu(int frame) {
-    /* Judul: panel gradasi dengan bingkai terang */
-    rect(L_HUD_TOP, 40, 52, 240, 2, 255, 255, 210);
-    rect(L_HUD_TOP, 40, 94, 240, 2, 130, 30, 10);
-    rectGradV(L_HUD_BASE, 40, 52, 240, 44, 255, 150, 40, 200, 40, 20);
+    roundedPanel(L_HUD_BASE, 40, 52, 240, 44, 12, 255, 150, 40, 0);
+    roundedPanel(L_HUD_TOP, 40, 52, 240, 44, 12, 255, 255, 255, 1);
+    setBlendMode(L_HUD_TOP, 0);
 
-    rect(L_HUD_TOP, 60, 112, 200, 1, 60, 140, 255);
+    glowDisc(160, 74, 90, 255, 180, 60, 8);
 
-    /* Pesawat naik-turun pelan */
     int bob = sinS(frame / 2) / 20;
     drawPlayer(SCREEN_W / 2 - 8, 140 + bob, frame);
 }
@@ -426,14 +568,6 @@ static void enemySize(const Enemy *e, int *w, int *h) {
     case E_BOSS: *w = 48; *h = 44; break;
     case E_TANK: *w = 22; *h = 22; break;
     default:     *w = 16; *h = 18; break;
-    }
-}
-
-static void initStars(void) {
-    for (int i = 0; i < NUM_STARS; i++) {
-        stars[i].x = rand() % SCREEN_W;
-        stars[i].y = rand() % SCREEN_H;
-        stars[i].speed = 1 + (i % 3);
     }
 }
 
@@ -495,6 +629,7 @@ int main(void) {
                 stars[i].x = rand() % SCREEN_W;
             }
         }
+        updateShootingStar(frame);
 
         for (int i = 0; i < MAX_EXPLOSIONS; i++) {
             if (!explosions[i].alive) continue;
@@ -645,12 +780,8 @@ int main(void) {
         /* ---------- Gambar ---------- */
 
         drawBackground(frame);
-
-        for (int i = 0; i < NUM_STARS; i++) {
-            int c = 90 + stars[i].speed * 55;
-            rect(L_PLANET, stars[i].x, stars[i].y,
-                 stars[i].speed, stars[i].speed, c, c, c);
-        }
+        drawStars(frame);
+        drawShootingStar();
 
         if (state == STATE_MENU) {
             drawMenu(frame);
@@ -681,6 +812,11 @@ int main(void) {
             FntPrint(-1, "SCORE %d\n\n\n\n\n\n\n\n    GAME OVER\n\n    FINAL %d\n\n\n    PRESS START", score, score);
         }
         FntFlush(-1);
+
+        /* HARUS terakhir: mengatur mode blend layer L_GLOW sebelum flip,
+           supaya semua glowDisc() yang ditambahkan sepanjang frame ini
+           diproses GPU dengan mode aditif. */
+        setBlendMode(L_GLOW, 1);
 
         flip();
         frame++;

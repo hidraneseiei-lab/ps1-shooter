@@ -26,6 +26,9 @@ typedef struct { int x, y, alive; } Obj;
 
 #define MAX_BULLETS 8
 #define MAX_ENEMIES 6
+#define START_LIVES 3
+
+enum { STATE_PLAY, STATE_GAMEOVER };
 
 static Obj bullets[MAX_BULLETS];
 static Obj enemies[MAX_ENEMIES];
@@ -73,27 +76,50 @@ static void drawRect(int x, int y, int w, int h, int r, int g, int b) {
     nextpri += sizeof(TILE);
 }
 
+static int overlap(int ax, int ay, int aw, int ah,
+                   int bx, int by, int bw, int bh) {
+    return ax < bx + bw && ax + aw > bx &&
+           ay < by + bh && ay + ah > by;
+}
+
+static void resetGame(int *px, int *py, int *score, int *lives,
+                      int *invuln, int *frame) {
+    for (int i = 0; i < MAX_BULLETS; i++) bullets[i].alive = 0;
+    for (int i = 0; i < MAX_ENEMIES; i++) enemies[i].alive = 0;
+    *px     = SCREEN_W / 2;
+    *py     = SCREEN_H - 30;
+    *score  = 0;
+    *lives  = START_LIVES;
+    *invuln = 0;
+    *frame  = 0;
+}
+
 int main(void) {
-    int px = SCREEN_W / 2;
-    int py = SCREEN_H - 30;
-    int frame = 0;
-    int score = 0;
+    int px, py, score, lives, invuln, frame;
+    int state = STATE_PLAY;
 
     initVideo();
+
+    /* Font bawaan PSn00bSDK untuk teks skor dan nyawa */
+    FntLoad(960, 0);
+    FntOpen(8, 8, SCREEN_W - 16, 32, 0, 128);
 
     InitPAD(padbuf[0], 34, padbuf[1], 34);
     StartPAD();
     ChangeClearPAD(0);
 
+    resetGame(&px, &py, &score, &lives, &invuln, &frame);
+
     ClearOTagR(buffers[0].ot, OT_LEN);
     nextpri = buffers[0].buf;
 
     while (1) {
-        /* --- Input --- */
         PADTYPE *pad = (PADTYPE *)padbuf[0];
-        if (pad->stat == 0) {
-            uint16_t btn = pad->btn;
+        uint16_t btn = 0xFFFF;
+        if (pad->stat == 0) btn = pad->btn;
 
+        if (state == STATE_PLAY) {
+            /* --- Input --- */
             if (!(btn & PAD_LEFT)  && px > 0)             px -= 3;
             if (!(btn & PAD_RIGHT) && px < SCREEN_W - 16) px += 3;
 
@@ -107,49 +133,67 @@ int main(void) {
                     }
                 }
             }
-        }
 
-        /* --- Spawn musuh --- */
-        if (frame % 30 == 0) {
-            for (int i = 0; i < MAX_ENEMIES; i++) {
-                if (!enemies[i].alive) {
-                    enemies[i].x = rand() % (SCREEN_W - 16);
-                    enemies[i].y = -16;
-                    enemies[i].alive = 1;
-                    break;
+            /* --- Spawn musuh --- */
+            if (frame % 30 == 0) {
+                for (int i = 0; i < MAX_ENEMIES; i++) {
+                    if (!enemies[i].alive) {
+                        enemies[i].x = rand() % (SCREEN_W - 16);
+                        enemies[i].y = -16;
+                        enemies[i].alive = 1;
+                        break;
+                    }
                 }
             }
-        }
 
-        /* --- Update peluru --- */
-        for (int i = 0; i < MAX_BULLETS; i++) {
-            if (!bullets[i].alive) continue;
-            bullets[i].y -= 5;
-            if (bullets[i].y < -8) bullets[i].alive = 0;
-        }
+            /* --- Update peluru --- */
+            for (int i = 0; i < MAX_BULLETS; i++) {
+                if (!bullets[i].alive) continue;
+                bullets[i].y -= 5;
+                if (bullets[i].y < -8) bullets[i].alive = 0;
+            }
 
-        /* --- Update musuh + tabrakan --- */
-        for (int i = 0; i < MAX_ENEMIES; i++) {
-            if (!enemies[i].alive) continue;
+            /* --- Update musuh, tabrakan peluru, tabrakan kapal --- */
+            if (invuln > 0) invuln--;
 
-            enemies[i].y += 1;
-            if (enemies[i].y > SCREEN_H) enemies[i].alive = 0;
+            for (int i = 0; i < MAX_ENEMIES; i++) {
+                if (!enemies[i].alive) continue;
 
-            for (int j = 0; j < MAX_BULLETS; j++) {
-                if (bullets[j].alive &&
-                    bullets[j].x > enemies[i].x - 4 &&
-                    bullets[j].x < enemies[i].x + 16 &&
-                    bullets[j].y > enemies[i].y - 4 &&
-                    bullets[j].y < enemies[i].y + 16) {
-                    enemies[i].alive = 0;
-                    bullets[j].alive = 0;
-                    score++;
+                enemies[i].y += 1;
+                if (enemies[i].y > SCREEN_H) enemies[i].alive = 0;
+
+                for (int j = 0; j < MAX_BULLETS; j++) {
+                    if (bullets[j].alive && enemies[i].alive &&
+                        overlap(bullets[j].x, bullets[j].y, 4, 8,
+                                enemies[i].x, enemies[i].y, 16, 16)) {
+                        enemies[i].alive = 0;
+                        bullets[j].alive = 0;
+                        score++;
+                    }
                 }
+
+                /* Musuh nabrak kapal */
+                if (enemies[i].alive && invuln == 0 &&
+                    overlap(px, py, 16, 16,
+                            enemies[i].x, enemies[i].y, 16, 16)) {
+                    enemies[i].alive = 0;
+                    lives--;
+                    invuln = 90;   /* kebal ~1,5 detik */
+                    if (lives <= 0) state = STATE_GAMEOVER;
+                }
+            }
+        } else {
+            /* GAME OVER: tekan START buat main lagi */
+            if (!(btn & PAD_START)) {
+                resetGame(&px, &py, &score, &lives, &invuln, &frame);
+                state = STATE_PLAY;
             }
         }
 
         /* --- Gambar --- */
-        drawRect(px, py, 16, 16, 0, 255, 0);
+        /* Kapal berkedip saat kebal */
+        if (state == STATE_PLAY && (invuln == 0 || (frame / 4) % 2 == 0))
+            drawRect(px, py, 16, 16, 0, 255, 0);
 
         for (int i = 0; i < MAX_BULLETS; i++)
             if (bullets[i].alive)
@@ -158,6 +202,14 @@ int main(void) {
         for (int i = 0; i < MAX_ENEMIES; i++)
             if (enemies[i].alive)
                 drawRect(enemies[i].x, enemies[i].y, 16, 16, 255, 0, 0);
+
+        /* Teks skor/nyawa/game over */
+        if (state == STATE_PLAY) {
+            FntPrint(-1, "SCORE %d   LIVES %d", score, lives);
+        } else {
+            FntPrint(-1, "GAME OVER\nSCORE %d\nPRESS START", score);
+        }
+        FntFlush(-1);
 
         flip();
         frame++;

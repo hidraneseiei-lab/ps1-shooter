@@ -21,16 +21,15 @@ static RenderBuffer buffers[2];
 static uint8_t     *nextpri;
 static int          active;
 static uint8_t      padbuf[2][34];
+static uint16_t     prevBtn = 0xFFFF;
 
 /* DrawOTag menggambar dari index TINGGI ke RENDAH.
    Index tinggi = digambar duluan = paling BELAKANG.
    Dalam satu layer, primitif yang ditambahkan BELAKANGAN digambar DULUAN.
 
    L_GLOW adalah layer khusus semi-transparency (additive blend).
-   Primitif di layer ini WAJIB ditambahkan lewat glowDisc(), dan
-   setBlendMode(L_GLOW, 1) HARUS dipanggil PALING TERAKHIR tiap frame
-   (persis sebelum flip()) supaya mode blend aktif sebelum GPU
-   memproses primitif glow di layer itu. */
+   Semua glowDisc() masuk ke sini. setBlendMode(L_GLOW,1) WAJIB
+   dipanggil PALING TERAKHIR tiap frame (persis sebelum flip()). */
 enum { L_HUD_TOP = 0, L_HUD_BASE = 1, L_GLOW = 2, L_FX = 3, L_PLAYER = 4,
        L_BULLET = 5, L_ENEMY = 6, L_PLANET = 7, L_BG = 8 };
 
@@ -51,7 +50,7 @@ typedef struct { int x, y, speed, layer, phase; } Star;
 #define HUD_H   30
 #define TEXT_Y  12
 
-enum { STATE_MENU, STATE_PLAY, STATE_GAMEOVER };
+enum { STATE_MENU, STATE_PLAY, STATE_GAMEOVER, STATE_GACHA, STATE_SKINSELECT };
 enum { E_DRONE = 0, E_ZIGZAG = 1, E_TANK = 2, E_BOSS = 3 };
 
 static Bullet    bullets[MAX_BULLETS];
@@ -62,19 +61,23 @@ static Star      stars[NUM_STARS];
 
 static int shootX = -100, shootY = 0, shootT = 0;
 
-/* Sin/cos 16 langkah (skala 0..127), untuk lingkaran dan gerak */
+/* Sin/cos 16 langkah (skala 0..127) */
 static const int8_t sin16[16] = {
     0, 49, 90, 117, 127, 117, 90, 49, 0, -49, -90, -117, -127, -117, -90, -49
 };
 static int sinI(int t) { return sin16[t & 15]; }
 static int cosI(int t) { return sin16[(t + 4) & 15]; }
 
-/* Tabel sinus halus 32 langkah untuk gerak zig-zag dan denyut */
+/* Tabel sinus halus 32 langkah */
 static const int8_t sinTab[32] = {
     0, 24, 48, 70, 89, 105, 116, 124, 127, 124, 116, 105, 89, 70, 48, 24,
     0, -24, -48, -70, -89, -105, -116, -124, -127, -124, -116, -105, -89, -70, -48, -24
 };
 static int sinS(int t) { return sinTab[t & 31]; }
+
+static int pressed(uint16_t btn, uint16_t mask) {
+    return !(btn & mask) && (prevBtn & mask);
+}
 
 static void initVideo(void) {
     ResetGraph(0);
@@ -151,14 +154,9 @@ static void rectGradV(int layer, int x, int y, int w, int h,
     nextpri += sizeof(POLY_G4);
 }
 
-/* Ganti mode blending GPU untuk sebuah layer.
-   mode 0 = (B+F)/2  -> transparan lembut, cocok panel kaca
-   mode 1 = B+F      -> aditif terang, cocok glow/neon/api
-   mode 2 = B-F      -> jarang dipakai (invert)
-   mode 3 = B+F/4    -> aditif halus, cocok kabut/atmosfer
-   CATATAN: nama fungsi setDrawMode/getTPage & urutan parameter bisa
-   sedikit beda antar versi PSn00bSDK. Kalau gagal compile, cek
-   psxgpu.h yang terpasang dan sesuaikan. */
+/* mode 0 = (B+F)/2 transparan lembut | mode 1 = B+F aditif terang (neon)
+   mode 3 = B+F/4 aditif halus. Nama DR_TPAGE/setDrawTPage sesuai
+   PSn00bSDK 0.24 -- kalau versi lain error, cek psxgpu.h. */
 static void setBlendMode(int layer, int mode) {
     DR_TPAGE *p = (DR_TPAGE *)nextpri;
     setDrawTPage(p, 0, 1, getTPage(0, mode, 0, 0));
@@ -166,7 +164,6 @@ static void setBlendMode(int layer, int mode) {
     nextpri += sizeof(DR_TPAGE);
 }
 
-/* Lingkaran solid 16 sisi (halus, dipakai untuk objek besar: planet, kilau) */
 static void disc(int layer, int cx, int cy, int rad,
                  int cr, int cg, int cb, int er, int eg, int eb) {
     for (int i = 0; i < 16; i++) {
@@ -178,7 +175,6 @@ static void disc(int layer, int cx, int cy, int rad,
     }
 }
 
-/* Lingkaran solid 8 sisi (murah, dipakai objek kecil: bintang, titik indikator) */
 static void discLo(int layer, int cx, int cy, int rad,
                    int cr, int cg, int cb, int er, int eg, int eb) {
     for (int i = 0; i < 16; i += 2) {
@@ -190,10 +186,6 @@ static void discLo(int layer, int cx, int cy, int rad,
     }
 }
 
-/* Lingkaran GLOW: 8 segitiga semi-transparan aditif, pusat terang -> tepi
-   memudar ke hitam. Digabung sama setBlendMode(L_GLOW,1) hasilnya jadi
-   cahaya neon lembut, jauh lebih murah & lebih bagus dari disc() gradient
-   biasa. Selalu masuk ke layer L_GLOW. */
 static void glowDisc(int cx, int cy, int rad, int r, int g, int b, int sides) {
     int step = 16 / sides; if (step < 1) step = 1;
     for (int i = 0; i < 16; i += step) {
@@ -213,7 +205,6 @@ static void glowDisc(int cx, int cy, int rad, int r, int g, int b, int sides) {
     }
 }
 
-/* Bintang bergerigi (untuk ledakan) */
 static void burst(int layer, int cx, int cy, int rOut, int rIn, int rot,
                   int cr, int cg, int cb, int er, int eg, int eb) {
     for (int i = 0; i < 8; i++) {
@@ -230,7 +221,7 @@ static void burst(int layer, int cx, int cy, int rOut, int rIn, int rot,
     }
 }
 
-/* ---------- UI melengkung (rounded panel / glassmorphism) ---------- */
+/* ---------- UI melengkung ---------- */
 
 static void flatRect(int layer, int x, int y, int w, int h,
                      int r, int g, int b, int trans) {
@@ -243,8 +234,6 @@ static void flatRect(int layer, int x, int y, int w, int h,
     nextpri += sizeof(POLY_F4);
 }
 
-/* q = kuadran (0..3). Kalau arahnya kebalik pas dites, tukar angka q
-   di pemanggilan roundedPanel() sampai sudutnya pas. */
 static void quarterDisc(int layer, int cx, int cy, int rad, int q,
                         int r, int g, int b, int trans) {
     int base = q * 4;
@@ -276,7 +265,7 @@ static void roundedPanel(int layer, int x, int y, int w, int h, int rad,
     quarterDisc(layer, x + w - rad,   y + h - rad,   rad, 0, r, g, b, trans);
 }
 
-/* ---------- Planet dengan pencahayaan semu (fake sphere lighting) ---------- */
+/* ---------- Planet fake sphere lighting ---------- */
 
 static void planetSphere(int cx, int cy, int rad,
                          int litR, int litG, int litB,
@@ -286,7 +275,7 @@ static void planetSphere(int cx, int cy, int rad,
         int y1 = cy + sinI(i)     * rad / 127;
         int x2 = cx + cosI(i + 1) * rad / 127;
         int y2 = cy + sinI(i + 1) * rad / 127;
-        int litAmt = cosI(i) + 127; /* 0..254: terang di satu sisi, gelap di sisi lain */
+        int litAmt = cosI(i) + 127;
         int r = darkR + (litR - darkR) * litAmt / 254;
         int g = darkG + (litG - darkG) * litAmt / 254;
         int b = darkB + (litB - darkB) * litAmt / 254;
@@ -294,11 +283,10 @@ static void planetSphere(int cx, int cy, int rad,
                       x1, y1, r / 3, g / 3, b / 3,
                       x2, y2, r / 3, g / 3, b / 3);
     }
-    /* atmosfer tipis mengikuti sisi terang */
     glowDisc(cx - rad / 4, cy - rad / 4, rad + 6, litR, litG, litB, 8);
 }
 
-/* ---------- Starfield: parallax 3 lapis + kelip + shooting star ---------- */
+/* ---------- Starfield ---------- */
 
 static void initStars(void) {
     for (int i = 0; i < NUM_STARS; i++) {
@@ -365,26 +353,105 @@ static void drawBackground(int frame) {
     rectGradV(L_BG, 0, SCREEN_H / 2, SCREEN_W, SCREEN_H / 2, 6, 8, 38, 2, 4, 20);
 }
 
-/* ---------- Pesawat pemain ---------- */
+/* ---------- Skin system ---------- */
 
-static void drawPlayer(int x, int y, int frame) {
+typedef struct {
+    const char *name;
+    int hullR, hullG, hullB;
+    int wingR, wingG, wingB;
+    int glowR, glowG, glowB;
+    int rarity;   /* 0=common 1=rare 2=epic 3=legendary */
+} SkinDef;
+
+#define NUM_SKINS 6
+static const SkinDef skinTable[NUM_SKINS] = {
+    { "AZURE",   60,120,230,  20,60,200,   255,150,40,  0 },
+    { "CRIMSON", 230,40,60,   180,20,40,   255,80,20,   0 },
+    { "EMERALD", 40,220,140,  20,160,90,   120,255,180, 1 },
+    { "VIOLET",  180,60,230,  120,20,180,  220,120,255, 1 },
+    { "GOLD",    255,210,60,  220,160,20,  255,240,180, 2 },
+    { "PRISM",   240,240,255, 180,200,255, 255,255,255, 3 },
+};
+
+static unsigned int unlockedMask = 1;   /* bit0 (AZURE) selalu terbuka */
+static int currentSkin = 0;
+static int skinCursor  = 0;
+
+/* ---------- Gacha system ---------- */
+
+#define GACHA_COST 50
+static int gems = 0;
+static int gachaResultSkin = -1;
+static int gachaResultDup  = 0;
+static int gachaFlashT     = 0;
+
+static void awardGems(int score) {
+    gems += score / 2 + 5;
+}
+
+static int gachaRollRarity(void) {
+    int r = rand() % 100;
+    if (r < 60) return 0;
+    if (r < 85) return 1;
+    if (r < 97) return 2;
+    return 3;
+}
+
+static int gachaRoll(void) {
+    int rarity = gachaRollRarity();
+    int pool[NUM_SKINS], n = 0;
+    for (int i = 0; i < NUM_SKINS; i++)
+        if (skinTable[i].rarity == rarity) pool[n++] = i;
+    if (n == 0) return 0;
+    return pool[rand() % n];
+}
+
+static int doGachaPull(void) {
+    if (gems < GACHA_COST) return 0;
+    gems -= GACHA_COST;
+    int idx = gachaRoll();
+    gachaResultSkin = idx;
+    if (unlockedMask & (1u << idx)) {
+        gachaResultDup = 1;
+        gems += 15;
+    } else {
+        gachaResultDup = 0;
+        unlockedMask |= (1u << idx);
+    }
+    return 1;
+}
+
+/* ---------- Pesawat pemain (parametrik warna = skin) ---------- */
+
+static void drawPlayer(int x, int y, int frame, int skin) {
+    const SkinDef *s = &skinTable[skin];
     int cx = x + 8;
     int fl = 4 + (frame / 2) % 4;
 
-    glowDisc(cx - 4, y + 18, 4 + fl / 2, 255, 150, 40, 8);
-    glowDisc(cx + 4, y + 18, 4 + fl / 2, 255, 150, 40, 8);
-    tri(L_PLAYER, cx - 5, y + 16, 255, 255, 220,  cx - 2, y + 16, 255, 255, 220,  cx - 4, y + 16 + fl, 255, 60, 0);
-    tri(L_PLAYER, cx + 2, y + 16, 255, 255, 220,  cx + 5, y + 16, 255, 255, 220,  cx + 4, y + 16 + fl, 255, 60, 0);
+    glowDisc(cx - 4, y + 18, 4 + fl / 2, s->glowR, s->glowG, s->glowB, 8);
+    glowDisc(cx + 4, y + 18, 4 + fl / 2, s->glowR, s->glowG, s->glowB, 8);
+    tri(L_PLAYER, cx - 5, y + 16, 255, 255, 220,  cx - 2, y + 16, 255, 255, 220,
+                  cx - 4, y + 16 + fl, s->glowR, s->glowG / 3, 0);
+    tri(L_PLAYER, cx + 2, y + 16, 255, 255, 220,  cx + 5, y + 16, 255, 255, 220,
+                  cx + 4, y + 16 + fl, s->glowR, s->glowG / 3, 0);
 
-    tri(L_PLAYER, cx - 3, y + 4,  90, 200, 255,  x - 8,  y + 18, 20, 60, 200,  cx - 3, y + 15, 30, 100, 230);
-    tri(L_PLAYER, cx + 3, y + 4,  90, 200, 255,  x + 24, y + 18, 20, 60, 200,  cx + 3, y + 15, 30, 100, 230);
+    tri(L_PLAYER, cx - 3, y + 4,  clamp255(s->wingR+50), clamp255(s->wingG+50), 255,
+                  x - 8,  y + 18, s->wingR, s->wingG, s->wingB,
+                  cx - 3, y + 15, clamp255(s->wingR+20), clamp255(s->wingG+20), clamp255(s->wingB+20));
+    tri(L_PLAYER, cx + 3, y + 4,  clamp255(s->wingR+50), clamp255(s->wingG+50), 255,
+                  x + 24, y + 18, s->wingR, s->wingG, s->wingB,
+                  cx + 3, y + 15, clamp255(s->wingR+20), clamp255(s->wingG+20), clamp255(s->wingB+20));
     rect(L_PLAYER, x - 8,  y + 16, 3, 3, 255, 240, 80);
     rect(L_PLAYER, x + 21, y + 16, 3, 3, 255, 240, 80);
 
-    tri(L_PLAYER, cx, y - 4, 255, 255, 255,  cx - 6, y + 16, 60, 120, 230,  cx + 6, y + 16, 60, 120, 230);
+    tri(L_PLAYER, cx, y - 4, 255, 255, 255,
+                  cx - 6, y + 16, s->hullR, s->hullG, s->hullB,
+                  cx + 6, y + 16, s->hullR, s->hullG, s->hullB);
     rect(L_PLAYER, cx - 1, y + 6, 3, 8, 255, 150, 30);
 
-    tri(L_PLAYER, cx, y + 1, 220, 255, 255,  cx - 3, y + 9, 40, 160, 230,  cx + 3, y + 9, 40, 160, 230);
+    tri(L_PLAYER, cx, y + 1, 220, 255, 255,
+                  cx - 3, y + 9, 40, 160, 230,
+                  cx + 3, y + 9, 40, 160, 230);
 }
 
 /* ---------- Musuh ---------- */
@@ -442,7 +509,7 @@ static void drawLaser(int x, int y, int frame) {
     rect(L_BULLET, x + 1, y - 5, 2, 4,  255, 255, 255);
 }
 
-/* ---------- Ledakan ---------- */
+/* ---------- Ledakan & spark ---------- */
 
 static void drawExplosion(const Explosion *e) {
     int t     = EXPLOSION_LEN - e->timer;
@@ -552,7 +619,42 @@ static void drawMenu(int frame) {
     glowDisc(160, 74, 90, 255, 180, 60, 8);
 
     int bob = sinS(frame / 2) / 20;
-    drawPlayer(SCREEN_W / 2 - 8, 140 + bob, frame);
+    drawPlayer(SCREEN_W / 2 - 8, 140 + bob, frame, currentSkin);
+}
+
+/* ---------- Layar gacha ---------- */
+
+static void drawGachaScreen(int frame) {
+    roundedPanel(L_HUD_BASE, 30, 40, 260, 160, 14, 20, 15, 45, 0);
+    roundedPanel(L_HUD_TOP,  30, 40, 260, 160, 14, 255, 255, 255, 1);
+    setBlendMode(L_HUD_TOP, 0);
+
+    if (gachaFlashT > 0) {
+        glowDisc(160, 110, 30 + (20 - gachaFlashT), skinTable[gachaResultSkin].glowR,
+                 skinTable[gachaResultSkin].glowG, skinTable[gachaResultSkin].glowB, 8);
+        drawPlayer(152, 95, frame, gachaResultSkin);
+    } else {
+        glowDisc(160, 110, 26 + sinS(frame) / 16, 200, 180, 255, 8);
+    }
+}
+
+/* ---------- Layar pilih skin ---------- */
+
+static void drawSkinSelectScreen(int frame) {
+    roundedPanel(L_HUD_BASE, 10, 40, 300, 170, 14, 15, 20, 45, 0);
+    roundedPanel(L_HUD_TOP,  10, 40, 300, 170, 14, 255, 255, 255, 1);
+    setBlendMode(L_HUD_TOP, 0);
+
+    for (int i = 0; i < NUM_SKINS; i++) {
+        int col = i % 3, row = i / 3;
+        int x = 65 + col * 95, y = 75 + row * 75;
+        if (unlockedMask & (1u << i)) drawPlayer(x - 8, y, frame, i);
+        else                          disc(L_PLAYER, x, y + 8, 10, 40, 40, 50, 20, 20, 25);
+        if (i == skinCursor) {
+            rect(L_HUD_TOP, x - 22, y - 8,  44, 2, 255, 255, 255);
+            rect(L_HUD_TOP, x - 22, y + 32, 44, 2, 255, 255, 255);
+        }
+    }
 }
 
 /* ---------- Logika ---------- */
@@ -643,10 +745,14 @@ int main(void) {
         }
 
         if (state == STATE_MENU) {
-            if (!(btn & PAD_START) || !(btn & PAD_CROSS)) {
+            if (pressed(btn, PAD_START) || pressed(btn, PAD_CROSS)) {
                 resetGame(&px, &py, &score, &lives, &invuln, &frame, &cooldown, &bossOn);
                 nextBossScore = 30;
                 state = STATE_PLAY;
+            } else if (pressed(btn, PAD_SELECT)) {
+                state = STATE_GACHA;
+            } else if (pressed(btn, PAD_SQUARE)) {
+                state = STATE_SKINSELECT;
             }
         } else if (state == STATE_PLAY) {
             if (!(btn & PAD_LEFT)  && px > 0)             px -= 3;
@@ -767,14 +873,25 @@ int main(void) {
                     invuln = 90;
                     if (lives <= 0) {
                         spawnExplosion(px + 8, py + 8, 1);
+                        awardGems(score);
                         state = STATE_GAMEOVER;
                     }
                 }
             }
-        } else {
-            if (!(btn & PAD_START)) {
-                state = STATE_MENU;
+        } else if (state == STATE_GACHA) {
+            if (gachaFlashT > 0) gachaFlashT--;
+            if (pressed(btn, PAD_CROSS) && gachaFlashT == 0) {
+                if (doGachaPull()) gachaFlashT = 20;
             }
+            if (pressed(btn, PAD_CIRCLE)) state = STATE_MENU;
+        } else if (state == STATE_SKINSELECT) {
+            if (pressed(btn, PAD_LEFT))  skinCursor = (skinCursor + NUM_SKINS - 1) % NUM_SKINS;
+            if (pressed(btn, PAD_RIGHT)) skinCursor = (skinCursor + 1) % NUM_SKINS;
+            if (pressed(btn, PAD_CROSS) && (unlockedMask & (1u << skinCursor)))
+                currentSkin = skinCursor;
+            if (pressed(btn, PAD_CIRCLE)) state = STATE_MENU;
+        } else {
+            if (pressed(btn, PAD_START)) state = STATE_MENU;
         }
 
         /* ---------- Gambar ---------- */
@@ -785,6 +902,10 @@ int main(void) {
 
         if (state == STATE_MENU) {
             drawMenu(frame);
+        } else if (state == STATE_GACHA) {
+            drawGachaScreen(frame);
+        } else if (state == STATE_SKINSELECT) {
+            drawSkinSelectScreen(frame);
         } else {
             for (int i = 0; i < MAX_ENEMIES; i++)
                 if (enemies[i].alive) drawEnemy(&enemies[i], frame);
@@ -793,7 +914,7 @@ int main(void) {
                 if (bullets[i].alive) drawLaser(bullets[i].x, bullets[i].y, frame);
 
             if (state == STATE_PLAY && (invuln == 0 || (frame / 4) % 2 == 0))
-                drawPlayer(px, py, frame);
+                drawPlayer(px, py, frame, currentSkin);
 
             for (int i = 0; i < MAX_EXPLOSIONS; i++)
                 if (explosions[i].alive) drawExplosion(&explosions[i]);
@@ -805,20 +926,30 @@ int main(void) {
         }
 
         if (state == STATE_MENU) {
-            FntPrint(-1, "\n\n\n   SPACE SHOOTER\n\n\n\n\n\n\n\n\n\n\n\n\n\n   PRESS START");
+            FntPrint(-1, "\n\n\n   SPACE SHOOTER\n\n\n\n\n\n\n\n\n\n\n\n\n\n   PRESS START\n   SELECT=GACHA  SQUARE=SKIN\n   GEMS %d", gems);
         } else if (state == STATE_PLAY) {
-            FntPrint(-1, "SCORE %d", score);
+            FntPrint(-1, "SCORE %d   GEMS %d", score, gems);
+        } else if (state == STATE_GACHA) {
+            if (gachaFlashT > 0) {
+                FntPrint(-1, "\n\n\n\n\n\n\n\n\n\n\n\n      %s%s",
+                         skinTable[gachaResultSkin].name,
+                         gachaResultDup ? " (DUPLICATE +15 GEMS)" : " UNLOCKED!");
+            } else {
+                FntPrint(-1, "GEMS %d\n\n\n\n\n\n\n\n\n\n\n    X = PULL (%d GEMS)\n    O = KEMBALI", gems, GACHA_COST);
+            }
+        } else if (state == STATE_SKINSELECT) {
+            FntPrint(-1, "PILIH SKIN\n\n\n\n\n\n\n\n\n\n\n\n    %s%s\n    O = KEMBALI",
+                     skinTable[skinCursor].name,
+                     (unlockedMask & (1u << skinCursor)) ? "" : " (TERKUNCI)");
         } else {
             FntPrint(-1, "SCORE %d\n\n\n\n\n\n\n\n    GAME OVER\n\n    FINAL %d\n\n\n    PRESS START", score, score);
         }
         FntFlush(-1);
 
-        /* HARUS terakhir: mengatur mode blend layer L_GLOW sebelum flip,
-           supaya semua glowDisc() yang ditambahkan sepanjang frame ini
-           diproses GPU dengan mode aditif. */
         setBlendMode(L_GLOW, 1);
 
         flip();
+        prevBtn = btn;
         frame++;
     }
 

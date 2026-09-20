@@ -18,19 +18,24 @@ jobs:
       - name: Download PSn00bSDK
         run: |
           curl -L -o psn00bsdk.zip https://github.com/Lameguy64/PSn00bSDK/releases/download/v0.24/PSn00bSDK-0.24-Linux.zip
+          ls -la psn00bsdk.zip
           unzip -q psn00bsdk.zip -d $HOME/psn00bsdk
-          echo "$HOME/psn00bsdk/bin" >> $GITHUB_PATH
 
       - name: Lihat isi SDK
         run: |
-          ls -R $HOME/psn00bsdk | head -80
+          find $HOME/psn00bsdk -maxdepth 3 | head -60
+          echo "--- cari sdk.cmake ---"
           find $HOME/psn00bsdk -name "sdk.cmake"
 
       - name: Build
         run: |
+          SDK_CMAKE=$(find $HOME/psn00bsdk -name "sdk.cmake" | head -1)
+          echo "Pakai toolchain: $SDK_CMAKE"
+          SDK_ROOT=$(dirname $(dirname $(dirname "$SDK_CMAKE")))
+          echo "$SDK_ROOT/bin" >> $GITHUB_PATH
+          export PATH="$SDK_ROOT/bin:$PATH"
           cmake -B build -G Ninja \
-            -DCMAKE_TOOLCHAIN_FILE=$HOME/psn00bsdk/lib/libpsn00b/cmake/sdk.cmake \
-            -DPSN00BSDK_TC=$HOME/psn00bsdk/bin \
+            -DCMAKE_TOOLCHAIN_FILE="$SDK_CMAKE" \
             .
           cmake --build build
 

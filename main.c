@@ -26,31 +26,37 @@ static uint16_t     prevBtn = 0xFFFF;
 enum { L_HUD_TOP = 0, L_HUD_BASE = 1, L_GLOW = 2, L_FX = 3, L_PLAYER = 4,
        L_BULLET = 5, L_ENEMY = 6, L_PLANET = 7, L_BG = 8 };
 
-/* Enemy: field generik dipakai beda arti tergantung type -
-   shield = sisa perisai (E_SHIELDED) | timer = cooldown tembak (E_SHOOTER)
-   vx     = arah gerak pecahan (E_SHARD) */
 typedef struct { int x, y, alive, hp, type, t, shield, timer, vx; } Enemy;
 typedef struct { int x, y, alive, dx; } Bullet;
-typedef struct { int x, y, alive, vy; } EBullet;   /* peluru musuh */
+typedef struct { int x, y, alive, vy; } EBullet;
 typedef struct { int x, y, alive, timer, big; } Explosion;
 typedef struct { int x, y, vx, vy, life, maxlife, r, g, b, alive, size; } Spark;
 typedef struct { int x, y, speed, layer, phase; } Star;
+typedef struct { int x, y, alive, type; } Item;
 
 #define MAX_BULLETS    16
 #define MAX_EBULLETS   12
 #define MAX_ENEMIES    12
 #define MAX_EXPLOSIONS 8
 #define MAX_SPARKS     40
+#define MAX_ITEMS      8
 #define NUM_STARS      50
 #define START_LIVES    3
+#define MAX_LIVES      5
 #define EXPLOSION_LEN  20
 
 #define HUD_H   30
 #define TEXT_Y  12
 
+#define MAX_STACK        3
+#define SHIELD_DURATION  420   /* ~7 detik @60fps */
+#define POWER_DURATION   300   /* ~5 detik */
+#define SPEED_DURATION   360   /* ~6 detik */
+
 enum { STATE_MENU, STATE_PLAY, STATE_GAMEOVER, STATE_GACHA, STATE_SKINSELECT };
 enum { E_DRONE = 0, E_ZIGZAG = 1, E_TANK = 2, E_SPINNER = 3, E_SHOOTER = 4,
        E_SPLITTER = 5, E_SHIELDED = 6, E_SHARD = 7, E_BOSS = 8 };
+enum { ITEM_HEAL = 0, ITEM_SHIELD = 1, ITEM_POWER = 2, ITEM_SPEED = 3 };
 
 static Bullet    bullets[MAX_BULLETS];
 static EBullet   ebullets[MAX_EBULLETS];
@@ -58,8 +64,14 @@ static Enemy     enemies[MAX_ENEMIES];
 static Explosion explosions[MAX_EXPLOSIONS];
 static Spark     sparks[MAX_SPARKS];
 static Star      stars[NUM_STARS];
+static Item      items[MAX_ITEMS];
 
 static int shootX = -100, shootY = 0, shootT = 0;
+
+/* Status buff aktif pemain */
+static int shieldStack = 0, shieldTimer = 0;
+static int powerStack  = 0, powerTimer  = 0;
+static int speedStack  = 0, speedTimer  = 0;
 
 static const int8_t sin16[16] = {
     0, 49, 90, 117, 127, 117, 90, 49, 0, -49, -90, -117, -127, -117, -90, -49
@@ -399,6 +411,125 @@ static int doGachaPull(void) {
     return 1;
 }
 
+/* ---------- Item: drop, update, gambar ---------- */
+
+static void spawnItem(int x, int y) {
+    if (rand() % 100 >= 20) return;   /* 20% peluang drop */
+    for (int i = 0; i < MAX_ITEMS; i++) {
+        if (items[i].alive) continue;
+        items[i].x = x; items[i].y = y;
+        items[i].type = rand() % 4;
+        items[i].alive = 1;
+        return;
+    }
+}
+
+static void forceSpawnItem(int x, int y) {
+    for (int i = 0; i < MAX_ITEMS; i++) {
+        if (items[i].alive) continue;
+        items[i].x = x; items[i].y = y;
+        items[i].type = rand() % 4;
+        items[i].alive = 1;
+        return;
+    }
+}
+
+static void drawItem(const Item *it, int frame) {
+    int x = it->x, y = it->y;
+    int cx = x + 5, cy = y + 5;
+    int pulse = 7 + sinS(frame * 2) / 40;
+
+    switch (it->type) {
+    case ITEM_HEAL:
+        glowDisc(cx, cy, pulse, 60, 255, 120, 8);
+        rect(L_FX, x + 3, y,     4, 10, 255, 255, 255);
+        rect(L_FX, x,     y + 3, 10, 4, 255, 255, 255);
+        break;
+    case ITEM_SHIELD:
+        glowDisc(cx, cy, pulse, 80, 180, 255, 8);
+        disc(L_FX, cx, cy, 5, 160, 220, 255, 20, 70, 140);
+        break;
+    case ITEM_POWER:
+        glowDisc(cx, cy, pulse, 255, 120, 40, 8);
+        tri(L_FX, cx, y, 255, 220, 140, x + 1, y + 10, 255, 120, 40, x + 9, y + 10, 255, 120, 40);
+        break;
+    case ITEM_SPEED:
+        glowDisc(cx, cy, pulse, 255, 240, 80, 8);
+        tri(L_FX, x + 2, y, 255, 255, 180, x + 2, y + 10, 255, 230, 60, x + 9, y + 5, 255, 230, 60);
+        break;
+    }
+}
+
+/* Ambil efek item ke status pemain. lives dikirim lewat pointer
+   karena heal langsung memodifikasi nyawa. */
+static void applyItem(int type, int *lives) {
+    switch (type) {
+    case ITEM_HEAL:
+        if (*lives < MAX_LIVES) (*lives)++;
+        break;
+    case ITEM_SHIELD:
+        shieldStack = (shieldStack < MAX_STACK) ? shieldStack + 1 : MAX_STACK;
+        shieldTimer = SHIELD_DURATION;
+        break;
+    case ITEM_POWER:
+        powerStack = (powerStack < MAX_STACK) ? powerStack + 1 : MAX_STACK;
+        powerTimer = POWER_DURATION;
+        break;
+    case ITEM_SPEED:
+        speedStack = (speedStack < MAX_STACK) ? speedStack + 1 : MAX_STACK;
+        speedTimer = SPEED_DURATION;
+        break;
+    }
+}
+
+/* ---------- Ikon status buff (pojok kanan bawah) ---------- */
+
+static void drawBuffIcon(int x, int y, int r, int g, int b,
+                         int shape, int stack, int timer, int maxTimer) {
+    disc(L_HUD_TOP, x, y, 8, r / 3, g / 3, b / 3, 10, 10, 15);
+    glowDisc(x, y, 9, r, g, b, 8);
+
+    switch (shape) {
+    case 0: /* shield: cincin */
+        disc(L_HUD_TOP, x, y, 4, r, g, b, r / 2, g / 2, b / 2);
+        break;
+    case 1: /* power: panah atas */
+        tri(L_HUD_TOP, x, y - 4, 255, 255, 255, x - 4, y + 4, r, g, b, x + 4, y + 4, r, g, b);
+        break;
+    case 2: /* speed: panah kanan */
+        tri(L_HUD_TOP, x - 4, y - 4, 255, 255, 255, x - 4, y + 4, r, g, b, x + 4, y, r, g, b);
+        break;
+    }
+
+    for (int i = 0; i < stack; i++)
+        rect(L_HUD_TOP, x - 6 + i * 5, y + 11, 3, 3, r, g, b);
+
+    int w = 16 * timer / maxTimer;
+    rect(L_HUD_BASE, x - 8, y + 15, 16, 2, 40, 40, 50);
+    rect(L_HUD_BASE, x - 8, y + 15, w, 2, r, g, b);
+}
+
+static void drawActiveBuffs(void) {
+    int x = SCREEN_W - 20, y = SCREEN_H - 26;
+    if (shieldStack > 0) { drawBuffIcon(x, y, 80, 180, 255, 0, shieldStack, shieldTimer, SHIELD_DURATION); x -= 26; }
+    if (powerStack  > 0) { drawBuffIcon(x, y, 255, 120, 40, 1, powerStack,  powerTimer,  POWER_DURATION);  x -= 26; }
+    if (speedStack  > 0) { drawBuffIcon(x, y, 255, 240, 80, 2, speedStack,  speedTimer,  SPEED_DURATION);  x -= 26; }
+}
+
+/* Aura visual shield yang mengorbit pemain */
+static void drawShieldAura(int px, int py, int frame) {
+    if (shieldStack <= 0) return;
+    int cx = px + 8, cy = py + 8;
+    int rad = 14 + shieldStack * 6;
+    glowDisc(cx, cy, rad, 80, 180, 255, 8);
+    for (int i = 0; i < shieldStack; i++) {
+        int a = (frame * 2 + i * (16 / MAX_STACK)) & 15;
+        int ox = cx + cosI(a) * rad / 127;
+        int oy = cy + sinI(a) * rad / 127;
+        glowDisc(ox, oy, 4, 150, 220, 255, 8);
+    }
+}
+
 /* ---------- Pesawat pemain ---------- */
 
 static void drawPlayer(int x, int y, int frame, int skin) {
@@ -432,7 +563,7 @@ static void drawPlayer(int x, int y, int frame, int skin) {
                   cx + 3, y + 9, 40, 160, 230);
 }
 
-/* ---------- Musuh: bentuk & animasi masing-masing beda total ---------- */
+/* ---------- Musuh ---------- */
 
 static void drawDrone(const Enemy *e, int frame) {
     int x = e->x, y = e->y, cx = x + 8;
@@ -461,7 +592,6 @@ static void drawTank(const Enemy *e, int frame) {
     tri(L_ENEMY, cx,     y + 22, 230, 180, 255, cx - 10, y,     110, 50, 190, cx + 10, y,     110, 50, 190);
 }
 
-/* Kincir berputar - benar-benar beda dari triangle biasa */
 static void drawSpinner(const Enemy *e, int frame) {
     int cx = e->x + 11, cy = e->y + 11;
     int rot = (e->t / 2) & 15;
@@ -477,7 +607,6 @@ static void drawSpinner(const Enemy *e, int frame) {
     }
 }
 
-/* Turret heksagon dengan laras - satu-satunya musuh yang nembak */
 static void drawShooter(const Enemy *e, int frame) {
     int cx = e->x + 11, cy = e->y + 10;
     int glow = 150 + ((frame / 4) & 1) * 90;
@@ -492,7 +621,6 @@ static void drawShooter(const Enemy *e, int frame) {
     if (e->timer <= 2) glowDisc(cx, cy + 17, 4, 255, 200, 80, 8);
 }
 
-/* Kristal berlian kembar - pecah jadi 2 shard saat mati */
 static void drawSplitter(const Enemy *e, int frame) {
     int cx = e->x + 10, cy = e->y + 10;
     int pulse = 3 + sinS(frame * 2) / 30;
@@ -501,7 +629,6 @@ static void drawSplitter(const Enemy *e, int frame) {
     glowDisc(cx, cy, 5, 255, 255, 150, 8);
 }
 
-/* Kapal kecil dengan cincin perisai berputar - shield harus dijebol dulu */
 static void drawShielded(const Enemy *e, int frame) {
     int cx = e->x + 10, cy = e->y + 10;
     tri(L_ENEMY, cx, cy + 9, 120, 200, 255, cx - 8, cy - 7, 40, 80, 170, cx + 8, cy - 7, 40, 80, 170);
@@ -519,7 +646,6 @@ static void drawShielded(const Enemy *e, int frame) {
     }
 }
 
-/* Pecahan kecil hasil Splitter */
 static void drawShard(const Enemy *e, int frame) {
     (void)frame;
     int cx = e->x + 5, cy = e->y + 5;
@@ -665,8 +791,8 @@ static void spawnShards(int x, int y) {
 /* ---------- HUD ---------- */
 
 static void drawHUD(int lives, int level) {
-    for (int i = 0; i < START_LIVES; i++) {
-        int lx = SCREEN_W - 26 - i * 18;
+    for (int i = 0; i < MAX_LIVES; i++) {
+        int lx = SCREEN_W - 20 - i * 14;
         if (i < lives) {
             tri(L_HUD_TOP, lx + 5, 8,  255, 255, 255,  lx, 21, 60, 120, 230,  lx + 10, 21, 60, 120, 230);
             rect(L_HUD_TOP, lx + 4, 20, 2, 3, 255, 150, 30);
@@ -748,6 +874,10 @@ static void resetGame(int *px, int *py, int *score, int *lives,
     for (int i = 0; i < MAX_ENEMIES; i++)    enemies[i].alive = 0;
     for (int i = 0; i < MAX_EXPLOSIONS; i++) explosions[i].alive = 0;
     for (int i = 0; i < MAX_SPARKS; i++)     sparks[i].alive = 0;
+    for (int i = 0; i < MAX_ITEMS; i++)      items[i].alive = 0;
+    shieldStack = shieldTimer = 0;
+    powerStack  = powerTimer  = 0;
+    speedStack  = speedTimer  = 0;
     *px       = SCREEN_W / 2 - 8;
     *py       = SCREEN_H - 34;
     *score    = 0;
@@ -758,7 +888,6 @@ static void resetGame(int *px, int *py, int *score, int *lives,
     *bossOn   = 0;
 }
 
-/* Musuh baru dibuka bertahap sesuai level, biar nggak numplek di awal */
 static int pickEnemyType(int level) {
     int pool[8], n = 0;
     pool[n++] = E_DRONE;
@@ -832,6 +961,11 @@ int main(void) {
             if (!(btn & PAD_UP)    && py > HUD_H + 16)    py -= 2;
             if (!(btn & PAD_DOWN)  && py < SCREEN_H - 24) py += 2;
 
+            /* Buff timer berjalan mundur, stack direset kalau habis */
+            if (shieldTimer > 0) { if (--shieldTimer <= 0) shieldStack = 0; }
+            if (powerTimer  > 0) { if (--powerTimer  <= 0) powerStack  = 0; }
+            if (speedTimer  > 0) { if (--speedTimer  <= 0) speedStack  = 0; }
+
             if (cooldown > 0) cooldown--;
             if (!(btn & PAD_CROSS) && cooldown == 0) {
                 int shots = (level >= 6) ? 3 : (level >= 3 ? 2 : 1);
@@ -845,7 +979,10 @@ int main(void) {
                     bullets[i].alive = 1;
                     made++;
                 }
-                cooldown = (level >= 5) ? 5 : 6;
+                int cd = (level >= 5) ? 5 : 6;
+                cd -= speedStack * 2;      /* buff speed: cooldown makin pendek tiap stack */
+                if (cd < 1) cd = 1;
+                cooldown = cd;
             }
 
             int spawnEvery = 42 - level * 3;
@@ -901,9 +1038,17 @@ int main(void) {
                 if (ebullets[i].y > SCREEN_H) ebullets[i].alive = 0;
             }
 
+            /* Item jatuh & hilang kalau keluar layar */
+            for (int i = 0; i < MAX_ITEMS; i++) {
+                if (!items[i].alive) continue;
+                items[i].y += 2;
+                if (items[i].y > SCREEN_H) items[i].alive = 0;
+            }
+
             if (invuln > 0) invuln--;
 
             int baseSpeed = 1 + level / 5;
+            int dmg = 1 + powerStack;   /* buff power: damage tembakan naik tiap stack */
 
             for (int i = 0; i < MAX_ENEMIES; i++) {
                 Enemy *e = &enemies[i];
@@ -965,7 +1110,7 @@ int main(void) {
                             spawnSparks(bullets[j].x + 2, bullets[j].y, 4, 100, 200, 255, 0);
                             continue;
                         }
-                        e->hp--;
+                        e->hp -= dmg;
                         spawnSparks(bullets[j].x + 2, bullets[j].y, 4, 120, 230, 255, 0);
                         if (e->hp <= 0) {
                             spawnExplosion(e->x + w / 2, e->y + h / 2,
@@ -978,18 +1123,40 @@ int main(void) {
                                 bossOn = 0;
                                 spawnExplosion(e->x + 10, e->y + 10, 1);
                                 spawnExplosion(e->x + 38, e->y + 30, 1);
+                                forceSpawnItem(e->x + 10, e->y + 10);
+                                forceSpawnItem(e->x + 38, e->y + 30);
                             } else if (e->type == E_TANK || e->type == E_SHIELDED) {
                                 score += 3;
+                                spawnItem(e->x + w / 2, e->y + h / 2);
                             } else if (e->type == E_SPLITTER || e->type == E_SHOOTER || e->type == E_SPINNER) {
                                 score += 2;
+                                spawnItem(e->x + w / 2, e->y + h / 2);
+                            } else if (e->type == E_SHARD) {
+                                score += 1;   /* shard tidak drop item, terlalu sering muncul */
                             } else {
                                 score += 1;
+                                spawnItem(e->x + w / 2, e->y + h / 2);
                             }
                         }
                     }
                 }
 
-                if (e->alive && invuln == 0 && overlap(px, py, 16, 16, e->x, e->y, w, h)) {
+                /* Shield: musuh non-boss yang mendekat langsung hancur */
+                if (shieldStack > 0 && e->alive && e->type != E_BOSS) {
+                    int srad = 14 + shieldStack * 6;
+                    int ex = e->x + w / 2, ey = e->y + h / 2;
+                    int dx = ex - (px + 8), dy = ey - (py + 8);
+                    if (dx * dx + dy * dy <= srad * srad) {
+                        spawnExplosion(ex, ey, 0);
+                        spawnSparks(ex, ey, 5, 120, 220, 255, 0);
+                        e->alive = 0;
+                        score += 1;
+                        continue;
+                    }
+                }
+
+                if (e->alive && invuln == 0 && shieldStack == 0 &&
+                    overlap(px, py, 16, 16, e->x, e->y, w, h)) {
                     spawnExplosion(e->x + w / 2, e->y + h / 2, 0);
                     if (e->type != E_BOSS) e->alive = 0;
                     lives--;
@@ -1004,7 +1171,14 @@ int main(void) {
 
             for (int i = 0; i < MAX_EBULLETS; i++) {
                 if (!ebullets[i].alive) continue;
-                if (invuln == 0 && overlap(px, py, 16, 16, ebullets[i].x, ebullets[i].y, 3, 9)) {
+                if (shieldStack > 0 &&
+                    overlap(px, py, 16, 16, ebullets[i].x, ebullets[i].y, 3, 9)) {
+                    ebullets[i].alive = 0;
+                    spawnSparks(ebullets[i].x, ebullets[i].y, 3, 100, 200, 255, 0);
+                    continue;
+                }
+                if (invuln == 0 && shieldStack == 0 &&
+                    overlap(px, py, 16, 16, ebullets[i].x, ebullets[i].y, 3, 9)) {
                     ebullets[i].alive = 0;
                     spawnExplosion(px + 8, py + 8, 0);
                     lives--;
@@ -1014,6 +1188,16 @@ int main(void) {
                         awardGems(score);
                         state = STATE_GAMEOVER;
                     }
+                }
+            }
+
+            /* Pemain ambil item */
+            for (int i = 0; i < MAX_ITEMS; i++) {
+                if (!items[i].alive) continue;
+                if (overlap(px, py, 16, 16, items[i].x, items[i].y, 10, 10)) {
+                    applyItem(items[i].type, &lives);
+                    spawnSparks(items[i].x + 5, items[i].y + 5, 5, 200, 255, 200, 0);
+                    items[i].alive = 0;
                 }
             }
         } else if (state == STATE_GACHA) {
@@ -1051,8 +1235,14 @@ int main(void) {
             for (int i = 0; i < MAX_EBULLETS; i++)
                 if (ebullets[i].alive) drawEBullet(&ebullets[i]);
 
-            if (state == STATE_PLAY && (invuln == 0 || (frame / 4) % 2 == 0))
-                drawPlayer(px, py, frame, currentSkin);
+            for (int i = 0; i < MAX_ITEMS; i++)
+                if (items[i].alive) drawItem(&items[i], frame);
+
+            if (state == STATE_PLAY) {
+                drawShieldAura(px, py, frame);
+                if (invuln == 0 || (frame / 4) % 2 == 0)
+                    drawPlayer(px, py, frame, currentSkin);
+            }
 
             for (int i = 0; i < MAX_EXPLOSIONS; i++)
                 if (explosions[i].alive) drawExplosion(&explosions[i]);
@@ -1061,6 +1251,7 @@ int main(void) {
                 if (sparks[i].alive) drawSpark(&sparks[i]);
 
             drawHUD(lives, level);
+            if (state == STATE_PLAY) drawActiveBuffs();
         }
 
         if (state == STATE_MENU) {

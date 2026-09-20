@@ -17,20 +17,20 @@ jobs:
     - name: Install Build Dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y cmake ninja-build build-essential wget unzip genisoimage
+        sudo apt-get install -y cmake ninja-build build-essential curl unzip genisoimage
 
     - name: Download and Setup PSn00bSDK
       run: |
         # Buat folder pusat untuk SDK
         sudo mkdir -p /opt/psn00bsdk
         
-        # Unduh rilisan resmi PSn00bSDK untuk arsitektur Linux
-        wget https://github.com
+        # Unduh rilisan resmi PSn00bSDK dengan argumen -L (follow redirect) agar mendownload ZIP asli
+        curl -L -o PSn00bSDK-0.24-Linux.zip https://github.com
         
         # Ekstrak file langsung ke dalam direktori /opt/psn00bsdk
         sudo unzip PSn00bSDK-0.24-Linux.zip -d /opt/psn00bsdk
         
-        # Berikan izin akses penuh ke folder agar proses eksekusi tidak tertahan permission
+        # Berikan izin akses penuh ke folder agar proses eksekusi berjalan lancar
         sudo chmod -R 777 /opt/psn00bsdk
 
     - name: Run CMake Configuration & Build

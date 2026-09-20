@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<iso_project image_name="shooter.bin" cue_sheet="shooter.cue">
+  <track type="data">
+    <identifiers system="PLAYSTATION" application="PLAYSTATION" volume="SHOOTER" />
+    <directory_tree>
+      <file name="SYSTEM.CNF" type="data" source="system.cnf" />
+      <file name="SHOOTER.EXE" type="data" source="shooter.exe" />
+      <dummy sectors="1024" />
+    </directory_tree>
+  </track>
+</iso_project>

@@ -1,0 +1,37 @@
+name: Build PS1
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+
+      - name: Download PSn00bSDK
+        run: |
+          curl -L -o psn00bsdk.zip https://github.com/Lameguy64/PSn00bSDK/releases/download/v0.24/PSn00bSDK-0.24-Linux.zip
+          unzip -q psn00bsdk.zip -d $HOME/psn00bsdk
+          echo "PSN00BSDK_LIBS=$HOME/psn00bsdk/lib/libpsn00b" >> $GITHUB_ENV
+          echo "$HOME/psn00bsdk/bin" >> $GITHUB_PATH
+
+      - name: Build
+        run: |
+          cmake --preset default .
+          cmake --build ./build
+
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: ps1-game
+          path: |
+            build/shooter.bin
+            build/shooter.cue
+            build/shooter.exe

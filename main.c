@@ -160,10 +160,10 @@ static void rectGradV(int layer, int x, int y, int w, int h,
    sedikit beda antar versi PSn00bSDK. Kalau gagal compile, cek
    psxgpu.h yang terpasang dan sesuaikan. */
 static void setBlendMode(int layer, int mode) {
-    DR_MODE *p = (DR_MODE *)nextpri;
-    setDrawMode(p, 0, 0, getTPage(0, mode, 0, 0), NULL);
+    DR_TPAGE *p = (DR_TPAGE *)nextpri;
+    setDrawTPage(p, 0, 1, getTPage(0, mode, 0, 0));
     addPrim(&buffers[active].ot[layer], p);
-    nextpri += sizeof(DR_MODE);
+    nextpri += sizeof(DR_TPAGE);
 }
 
 /* Lingkaran solid 16 sisi (halus, dipakai untuk objek besar: planet, kilau) */

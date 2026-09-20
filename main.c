@@ -25,17 +25,27 @@ static int          active;
 static uint8_t padbuf[2][34];
 static uint16_t prevBtn[MAX_PLAYERS] = { 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF };
 
+/* [FIX] hitbox pemain dulu magic number "16,16" ditulis berulang di banyak tempat */
+#define PLAYER_W 16
+#define PLAYER_H 16
+
 enum { L_HUD_TOP = 0, L_HUD_BASE = 1, L_GLOW = 2, L_FX = 3, L_PLAYER = 4,
        L_BULLET = 5, L_ENEMY = 6, L_PLANET = 7, L_BG = 8 };
 
-typedef struct { int x, y, alive, hp, type, t, shield, timer, vx; } Enemy;
+/* [FIX] Enemy: tambah vy, tx, ty, buff untuk kebutuhan 6 musuh baru
+   (vy/tx/ty dipakai Charger buat simpan arah & target dash,
+    buff dipakai Healer buat kasih "extra hit" ke musuh lain) */
+typedef struct { int x, y, alive, hp, type, t, shield, timer, vx, vy, tx, ty, buff; } Enemy;
 typedef struct { int x, y, alive, dx; } Bullet;
-typedef struct { int x, y, alive, vy; } EBullet;
+/* [FIX] EBullet: tambah vx supaya peluru musuh bisa mengarah (aim), bukan cuma lurus ke bawah */
+typedef struct { int x, y, alive, vx, vy; } EBullet;
 typedef struct { int x, y, alive, timer, big; } Explosion;
 typedef struct { int x, y, vx, vy, life, maxlife, r, g, b, alive, size; } Spark;
 typedef struct { int x, y, speed, layer, phase; } Star;
 typedef struct { int x, y, alive, type; } Item;
 typedef struct { int x, y, phase, timer, alive; } NovaBurst;
+/* [BARU] hazard ranjau, dipakai musuh Minelayer */
+typedef struct { int x, y, timer, alive; } Mine;
 
 #define MAX_BULLETS    48
 #define MAX_EBULLETS   16
@@ -52,6 +62,12 @@ typedef struct { int x, y, phase, timer, alive; } NovaBurst;
 #define NOVA_ACTIVE    18
 #define NOVA_LEN       220
 
+/* [BARU] konstanta 6 musuh baru */
+#define MAX_MINES       8
+#define MINE_LIFE       150
+#define MINE_ARM_AT     130
+#define ABSORBER_CHARGE 5
+
 #define HUD_H   30
 #define TEXT_Y  12
 
@@ -64,7 +80,9 @@ typedef struct { int x, y, phase, timer, alive; } NovaBurst;
 
 enum { STATE_MENU, STATE_PLAY, STATE_GAMEOVER, STATE_GACHA, STATE_SKINSELECT };
 enum { E_DRONE = 0, E_ZIGZAG, E_TANK, E_SPINNER, E_SHOOTER, E_SPLITTER, E_SHIELDED,
-       E_STINGER, E_ORBITER, E_PHANTOM, E_JUGGERNAUT, E_NOVA, E_SHARD, E_BOSS };
+       E_STINGER, E_ORBITER, E_PHANTOM, E_JUGGERNAUT, E_NOVA, E_SHARD, E_BOSS,
+       /* [BARU] 6 musuh baru, ditaruh di akhir biar nilai enum lama tidak berubah */
+       E_TURRET, E_MINELAYER, E_CHARGER, E_MIRROR, E_HEALER, E_ABSORBER };
 enum { ITEM_HEAL = 0, ITEM_SHIELD = 1, ITEM_POWER = 2, ITEM_SPEED = 3 };
 
 /* ---------- [MAD] Boss rahasia ---------- */
@@ -125,6 +143,7 @@ static Spark     sparks[MAX_SPARKS];
 static Star      stars[NUM_STARS];
 static Item      items[MAX_ITEMS];
 static NovaBurst novabursts[MAX_NOVABURST];
+static Mine      mines[MAX_MINES];   /* [BARU] */
 
 static int shootX = -100, shootY = 0, shootT = 0;
 
@@ -190,35 +209,47 @@ static void flip(void) {
 
 /* ---------- Primitif dasar ---------- */
 
+/* [FIX] semua alokasi primitif disentralisasi lewat primAlloc() supaya ada
+   bound-check terhadap BUFFER_LEN. Sebelumnya nextpri ditambah tanpa cek sama
+   sekali -> berisiko overflow diam-diam & merusak struct RenderBuffer lain. */
+static void *primAlloc(int size) {
+    uint8_t *base = buffers[active].buf;
+    if (nextpri + size > base + BUFFER_LEN) return NULL; /* buffer penuh, skip gambar drpd corrupt memory */
+    void *p = nextpri;
+    nextpri += size;
+    return p;
+}
+
 static int clamp255(int v) { return v < 0 ? 0 : (v > 255 ? 255 : v); }
 
 static void rect(int layer, int x, int y, int w, int h, int r, int g, int b) {
-    TILE *t = (TILE *)nextpri;
+    TILE *t = (TILE *)primAlloc(sizeof(TILE));
+    if (!t) return;
     setTile(t);
     setXY0(t, x, y);
     setWH(t, w, h);
     setRGB0(t, clamp255(r), clamp255(g), clamp255(b));
     addPrim(&buffers[active].ot[layer], t);
-    nextpri += sizeof(TILE);
 }
 
 static void tri(int layer,
                 int x0, int y0, int r0, int g0, int b0,
                 int x1, int y1, int r1, int g1, int b1,
                 int x2, int y2, int r2, int g2, int b2) {
-    POLY_G3 *p = (POLY_G3 *)nextpri;
+    POLY_G3 *p = (POLY_G3 *)primAlloc(sizeof(POLY_G3));
+    if (!p) return;
     setPolyG3(p);
     setXY3(p, x0, y0, x1, y1, x2, y2);
     setRGB0(p, clamp255(r0), clamp255(g0), clamp255(b0));
     setRGB1(p, clamp255(r1), clamp255(g1), clamp255(b1));
     setRGB2(p, clamp255(r2), clamp255(g2), clamp255(b2));
     addPrim(&buffers[active].ot[layer], p);
-    nextpri += sizeof(POLY_G3);
 }
 
 static void rectGradV(int layer, int x, int y, int w, int h,
                       int r0, int g0, int b0, int r1, int g1, int b1) {
-    POLY_G4 *p = (POLY_G4 *)nextpri;
+    POLY_G4 *p = (POLY_G4 *)primAlloc(sizeof(POLY_G4));
+    if (!p) return;
     setPolyG4(p);
     setXY4(p, x, y, x + w, y, x, y + h, x + w, y + h);
     setRGB0(p, clamp255(r0), clamp255(g0), clamp255(b0));
@@ -226,14 +257,13 @@ static void rectGradV(int layer, int x, int y, int w, int h,
     setRGB2(p, clamp255(r1), clamp255(g1), clamp255(b1));
     setRGB3(p, clamp255(r1), clamp255(g1), clamp255(b1));
     addPrim(&buffers[active].ot[layer], p);
-    nextpri += sizeof(POLY_G4);
 }
 
 static void setBlendMode(int layer, int mode) {
-    DR_TPAGE *p = (DR_TPAGE *)nextpri;
+    DR_TPAGE *p = (DR_TPAGE *)primAlloc(sizeof(DR_TPAGE));
+    if (!p) return;
     setDrawTPage(p, 0, 1, getTPage(0, mode, 0, 0));
     addPrim(&buffers[active].ot[layer], p);
-    nextpri += sizeof(DR_TPAGE);
 }
 
 static void disc(int layer, int cx, int cy, int rad,
@@ -265,7 +295,8 @@ static void glowDisc(int cx, int cy, int rad, int r, int g, int b, int sides) {
         int y1 = cy + sinI(i)        * rad / 127;
         int x2 = cx + cosI(i + step) * rad / 127;
         int y2 = cy + sinI(i + step) * rad / 127;
-        POLY_G3 *p = (POLY_G3 *)nextpri;
+        POLY_G3 *p = (POLY_G3 *)primAlloc(sizeof(POLY_G3));
+        if (!p) return;
         setPolyG3(p);
         setSemiTrans(p, 1);
         setXY3(p, cx, cy, x1, y1, x2, y2);
@@ -273,7 +304,6 @@ static void glowDisc(int cx, int cy, int rad, int r, int g, int b, int sides) {
         setRGB1(p, 0, 0, 0);
         setRGB2(p, 0, 0, 0);
         addPrim(&buffers[active].ot[L_GLOW], p);
-        nextpri += sizeof(POLY_G3);
     }
 }
 
@@ -300,13 +330,13 @@ static void beamQuad(int layer, int cx, int cy, int angle, int len, int thick,
     int hx1 = cx + dx * len / 127, hy1 = cy + dy * len / 127;
     int hx2 = cx - dx * len / 127, hy2 = cy - dy * len / 127;
     int ox = nx * thick / 254, oy = ny * thick / 254;
-    POLY_F4 *p = (POLY_F4 *)nextpri;
+    POLY_F4 *p = (POLY_F4 *)primAlloc(sizeof(POLY_F4));
+    if (!p) return;
     setPolyF4(p);
     if (trans) setSemiTrans(p, 1);
     setXY4(p, hx1 + ox, hy1 + oy, hx1 - ox, hy1 - oy, hx2 + ox, hy2 + oy, hx2 - ox, hy2 - oy);
     setRGB0(p, clamp255(r), clamp255(g), clamp255(b));
     addPrim(&buffers[active].ot[layer], p);
-    nextpri += sizeof(POLY_F4);
 }
 
 static int beamHit(int bx, int by, int angle, int len, int halfThick, int px, int py) {
@@ -319,17 +349,29 @@ static int beamHit(int bx, int by, int angle, int len, int halfThick, int px, in
     return (cross / 127) < halfThick;
 }
 
+/* [BARU] normalisasi arah tanpa sqrt (Chebyshev-scaled) - dipakai musuh
+   Turret & Absorber untuk menembak terarah ke posisi pemain */
+static void aimVector(int fromX, int fromY, int toX, int toY, int speed, int *outVx, int *outVy) {
+    int dx = toX - fromX, dy = toY - fromY;
+    int adx = dx < 0 ? -dx : dx;
+    int ady = dy < 0 ? -dy : dy;
+    int m = adx > ady ? adx : ady;
+    if (m == 0) { *outVx = 0; *outVy = speed; return; }
+    *outVx = dx * speed / m;
+    *outVy = dy * speed / m;
+}
+
 /* ---------- UI melengkung ---------- */
 
 static void flatRect(int layer, int x, int y, int w, int h,
                      int r, int g, int b, int trans) {
-    POLY_F4 *p = (POLY_F4 *)nextpri;
+    POLY_F4 *p = (POLY_F4 *)primAlloc(sizeof(POLY_F4));
+    if (!p) return;
     setPolyF4(p);
     if (trans) setSemiTrans(p, 1);
     setXY4(p, x, y, x + w, y, x, y + h, x + w, y + h);
     setRGB0(p, clamp255(r), clamp255(g), clamp255(b));
     addPrim(&buffers[active].ot[layer], p);
-    nextpri += sizeof(POLY_F4);
 }
 
 static void quarterDisc(int layer, int cx, int cy, int rad, int q,
@@ -340,7 +382,8 @@ static void quarterDisc(int layer, int cx, int cy, int rad, int q,
         int y1 = cy + sinI(base + i)     * rad / 127;
         int x2 = cx + cosI(base + i + 1) * rad / 127;
         int y2 = cy + sinI(base + i + 1) * rad / 127;
-        POLY_G3 *p = (POLY_G3 *)nextpri;
+        POLY_G3 *p = (POLY_G3 *)primAlloc(sizeof(POLY_G3));
+        if (!p) return;
         setPolyG3(p);
         if (trans) setSemiTrans(p, 1);
         setXY3(p, cx, cy, x1, y1, x2, y2);
@@ -348,7 +391,6 @@ static void quarterDisc(int layer, int cx, int cy, int rad, int q,
         setRGB1(p, clamp255(r), clamp255(g), clamp255(b));
         setRGB2(p, clamp255(r), clamp255(g), clamp255(b));
         addPrim(&buffers[active].ot[layer], p);
-        nextpri += sizeof(POLY_G3);
     }
 }
 
@@ -815,6 +857,86 @@ static void drawNova(const Enemy *e, int frame) {
     }
 }
 
+/* [BARU] 6 musuh baru */
+
+static void drawTurret(const Enemy *e, int frame) {
+    int x = e->x, y = e->y, cx = x + 12, cy = y + 12;
+    int locking = (e->vx != 0 && e->timer < 15);
+    rect(L_ENEMY, x, y + 10, 24, 14, 90, 90, 100);
+    tri(L_ENEMY, x, y + 24, 60, 60, 70, x + 24, y + 24, 60, 60, 70, cx, y + 10, 100, 100, 115);
+    glowDisc(cx, cy - 2, locking ? 8 : 5, locking ? 255 : 120, locking ? 60 : 160, 60, 8);
+    disc(L_ENEMY, cx, cy - 2, 5, 220, 80, 60, 80, 20, 20);
+    int rot = (frame / 4) & 15;
+    int lx = cx + cosI(rot) * 4 / 127, ly = (cy - 2) + sinI(rot) * 4 / 127;
+    rect(L_ENEMY, lx - 1, ly - 1, 2, 2, 255, 255, 255);
+}
+
+static void drawMinelayer(const Enemy *e, int frame) {
+    (void)frame;
+    int x = e->x, y = e->y, cx = x + 9;
+    int open = (e->timer < 12);
+    glowDisc(cx, y + 6, 5, 120, 255, 140, 8);
+    tri(L_ENEMY, x - 2, y + 4, 60, 160, 90, x + 20, y + 4, 60, 160, 90, cx, y + 16, 40, 110, 60);
+    rect(L_ENEMY, cx - 3, y + 10, 6, open ? 6 : 3, open ? 255 : 90, open ? 220 : 140, 60);
+    discLo(L_ENEMY, cx, y + 2, 3, 200, 255, 200, 60, 160, 90);
+}
+
+static void drawCharger(const Enemy *e, int frame) {
+    int x = e->x, y = e->y, cx = x + 8;
+    if (e->shield == 1) {
+        if (frame & 1) glowDisc(cx, y + 9, 10, 255, 60, 60, 8);
+    } else if (e->shield == 2) {
+        glowDisc(cx, y + 9, 6, 255, 180, 80, 8);
+    }
+    tri(L_ENEMY, cx, y - 4, 255, 200, 180, cx - 8, y + 14, 200, 60, 40, cx + 8, y + 14, 200, 60, 40);
+    tri(L_ENEMY, cx, y + 18, 255, 140, 100, cx - 5, y + 10, 160, 40, 30, cx + 5, y + 10, 160, 40, 30);
+    discLo(L_ENEMY, cx, y + 6, 2, 255, 255, 255, 255, 200, 180);
+}
+
+static void drawMirror(const Enemy *e, int frame) {
+    int cx = e->x + 8, cy = e->y + 8;
+    int pulse = sinS(frame * 3) / 30;
+    int a = e->shield ? 160 : 255; /* clone sedikit lebih redup */
+    tri(L_ENEMY, cx, cy - 8 - pulse, a, a, 255, cx - 7, cy, a/2, a/2, 200, cx, cy + 8 + pulse, a/3, a/3, 160);
+    tri(L_ENEMY, cx, cy - 8 - pulse, a, a, 255, cx + 7, cy, a/2, a/2, 200, cx, cy + 8 + pulse, a/3, a/3, 160);
+    glowDisc(cx, cy, 5, 160, 180, 255, 8);
+    discLo(L_ENEMY, cx, cy, 2, 255, 255, 255, 200, 220, 255);
+}
+
+static void drawHealer(const Enemy *e, int frame) {
+    int cx = e->x + 9, cy = e->y + 9;
+    int pulseSoon = e->timer < 15;
+    glowDisc(cx, cy, pulseSoon ? 10 : 6, 100, 255, 160, 8);
+    disc(L_ENEMY, cx, cy, 7, 180, 255, 200, 40, 140, 90);
+    rect(L_ENEMY, cx - 1, cy - 4, 2, 8, 255, 255, 255);
+    rect(L_ENEMY, cx - 4, cy - 1, 8, 2, 255, 255, 255);
+    if (pulseSoon && (frame & 2)) glowDisc(cx, cy, 30, 120, 255, 160, 8);
+}
+
+static void drawAbsorber(const Enemy *e, int frame) {
+    int cx = e->x + 11, cy = e->y + 11;
+    int glow = 100 + e->timer * 30;
+    if (glow > 255) glow = 255;
+    glowDisc(cx, cy, 10, glow, 80, 255, 8);
+    disc(L_ENEMY, cx, cy, 8, 160, 100, 255, 40, 20, 90);
+    int rot = (frame / 2) & 15;
+    for (int i = 0; i < 16; i += 4) {
+        int a = (i + rot) & 15;
+        int x1 = cx + cosI(a) * 12 / 127, y1 = cy + sinI(a) * 12 / 127;
+        rect(L_ENEMY, x1 - 1, y1 - 1, 2, 2, 220, 180, 255);
+    }
+    discLo(L_ENEMY, cx, cy, 3, 255, 255, 255, 200, 160, 255);
+}
+
+static void drawMine(const Mine *m, int frame) {
+    int armed = m->timer < MINE_ARM_AT;
+    int blinkRate = armed ? 4 : 10;
+    int on = (frame % blinkRate) < 2;
+    int v = on ? 255 : 80;
+    disc(L_ENEMY, m->x, m->y, 5, v, v / 4, v / 4, 60, 10, 10);
+    glowDisc(m->x, m->y, armed ? 8 : 5, v, 40, 30, 8);
+}
+
 static void drawEnemy(const Enemy *e, int frame) {
     switch (e->type) {
     case E_DRONE:      drawDrone(e, frame);      break;
@@ -830,6 +952,12 @@ static void drawEnemy(const Enemy *e, int frame) {
     case E_JUGGERNAUT: drawJuggernaut(e, frame); break;
     case E_NOVA:       drawNova(e, frame);       break;
     case E_SHARD:      drawShard(e, frame);      break;
+    case E_TURRET:     drawTurret(e, frame);     break;
+    case E_MINELAYER:  drawMinelayer(e, frame);  break;
+    case E_CHARGER:    drawCharger(e, frame);    break;
+    case E_MIRROR:     drawMirror(e, frame);     break;
+    case E_HEALER:     drawHealer(e, frame);     break;
+    case E_ABSORBER:   drawAbsorber(e, frame);   break;
     case E_BOSS: {
         int bx = e->x, by = e->y;
         int glow = 160 + ((frame / 3) & 1) * 90;
@@ -862,12 +990,15 @@ static void drawEBullet(const EBullet *b) {
     rect(L_BULLET, b->x, b->y, 3, 9, 255, 180, 120);
 }
 
-static void spawnEBullet(int x, int y) {
+/* [FIX] spawnEBullet sekarang menerima vx,vy supaya peluru bisa mengarah (aim),
+   bukan cuma jatuh lurus ke bawah. Semua pemanggilan lama harus diupdate. */
+static void spawnEBullet(int x, int y, int vx, int vy) {
     for (int i = 0; i < MAX_EBULLETS; i++) {
         if (ebullets[i].alive) continue;
         ebullets[i].x = x;
         ebullets[i].y = y;
-        ebullets[i].vy = 3;
+        ebullets[i].vx = vx;
+        ebullets[i].vy = vy;
         ebullets[i].alive = 1;
         break;
     }
@@ -980,8 +1111,51 @@ static void spawnShards(int x, int y) {
         enemies[k].hp = 1; enemies[k].t = 0;
         enemies[k].shield = 0; enemies[k].timer = 0;
         enemies[k].vx = made == 0 ? -3 : 3;
+        enemies[k].vy = 0; enemies[k].tx = 0; enemies[k].ty = 0; enemies[k].buff = 0;
         enemies[k].alive = 1;
         made++;
+    }
+}
+
+/* [BARU] fungsi bantu 6 musuh baru */
+
+static void spawnMine(int x, int y) {
+    for (int i = 0; i < MAX_MINES; i++) {
+        if (mines[i].alive) continue;
+        mines[i].x = x; mines[i].y = y;
+        mines[i].timer = MINE_LIFE;
+        mines[i].alive = 1;
+        return;
+    }
+}
+
+static void spawnMirrorClone(int x, int y) {
+    for (int k = 0; k < MAX_ENEMIES; k++) {
+        if (enemies[k].alive) continue;
+        enemies[k].type = E_MIRROR;
+        enemies[k].x = x + ((rand() & 1) ? 10 : -10);
+        enemies[k].y = y;
+        enemies[k].hp = 1;
+        enemies[k].t = 0;
+        enemies[k].shield = 1; /* [PENTING] sudah "dipakai" jatah split, tidak boleh clone lagi */
+        enemies[k].timer = 0;
+        enemies[k].vx = (rand() & 1) ? 2 : -2;
+        enemies[k].vy = 0; enemies[k].tx = 0; enemies[k].ty = 0; enemies[k].buff = 0;
+        enemies[k].alive = 1;
+        return;
+    }
+}
+
+static int nearestPlayer(int x, int y); /* forward decl, definisi lengkap di bawah */
+
+static void absorberRetaliate(int ex, int ey) {
+    int t = nearestPlayer(ex, ey);
+    int baseX = (t >= 0) ? players[t].x + 8 : ex;
+    int baseY = (t >= 0) ? players[t].y + 8 : ey + 60;
+    for (int k = -2; k <= 2; k++) {
+        int avx, avy;
+        aimVector(ex, ey, baseX + k * 16, baseY, 3, &avx, &avy);
+        spawnEBullet(ex, ey, avx, avy);
     }
 }
 
@@ -1075,6 +1249,12 @@ static void enemySize(const Enemy *e, int *w, int *h) {
     case E_STINGER:    *w = 16; *h = 18; break;
     case E_PHANTOM:    *w = 16; *h = 16; break;
     case E_NOVA:       *w = 16; *h = 16; break;
+    case E_TURRET:     *w = 24; *h = 26; break;
+    case E_MINELAYER:  *w = 20; *h = 18; break;
+    case E_CHARGER:    *w = 16; *h = 18; break;
+    case E_MIRROR:     *w = 16; *h = 16; break;
+    case E_HEALER:     *w = 18; *h = 18; break;
+    case E_ABSORBER:   *w = 22; *h = 22; break;
     default:           *w = 16; *h = 18; break;
     }
 }
@@ -1146,18 +1326,22 @@ static void clearWorld(void) {
     for (int i = 0; i < MAX_SPARKS; i++)     sparks[i].alive = 0;
     for (int i = 0; i < MAX_ITEMS; i++)      items[i].alive = 0;
     for (int i = 0; i < MAX_NOVABURST; i++)  novabursts[i].alive = 0;
+    for (int i = 0; i < MAX_MINES; i++)      mines[i].alive = 0;   /* [BARU] */
     madReset();
 }
 
+/* [FIX] pool[] dulu ukuran 16, dengan 6 tipe musuh baru ditambahkan ke pool
+   level>=9, total entri bisa tembus ~18 -> overflow risk. Dinaikkan ke 32. */
 static int pickEnemyType(int level) {
-    int pool[16], n = 0;
+    int pool[32], n = 0;
     pool[n++] = E_DRONE;
     if (level >= 3) pool[n++] = E_ZIGZAG;
     if (level >= 4) { pool[n++] = E_SPINNER;  pool[n++] = E_STINGER;    }
-    if (level >= 5) { pool[n++] = E_TANK;     pool[n++] = E_ORBITER;    }
-    if (level >= 6) { pool[n++] = E_SHOOTER;  pool[n++] = E_PHANTOM;    }
-    if (level >= 7) { pool[n++] = E_SPLITTER; pool[n++] = E_JUGGERNAUT; }
-    if (level >= 8) { pool[n++] = E_SHIELDED; pool[n++] = E_NOVA;       }
+    if (level >= 5) { pool[n++] = E_TANK;     pool[n++] = E_ORBITER;    pool[n++] = E_TURRET; }
+    if (level >= 6) { pool[n++] = E_SHOOTER;  pool[n++] = E_PHANTOM;    pool[n++] = E_MINELAYER; }
+    if (level >= 7) { pool[n++] = E_SPLITTER; pool[n++] = E_JUGGERNAUT; pool[n++] = E_CHARGER; }
+    if (level >= 8) { pool[n++] = E_SHIELDED; pool[n++] = E_NOVA;       pool[n++] = E_MIRROR; }
+    if (level >= 9) { pool[n++] = E_HEALER;   pool[n++] = E_ABSORBER;  }
     return pool[rand() % n];
 }
 
@@ -1272,6 +1456,7 @@ static void madSummonNova(void) {
             enemies[k].x = sides[s]; enemies[k].y = mad.y + 24;
             enemies[k].hp = 3; enemies[k].t = 0;
             enemies[k].shield = 0; enemies[k].timer = 0; enemies[k].vx = 0;
+            enemies[k].vy = 0; enemies[k].tx = 0; enemies[k].ty = 0; enemies[k].buff = 0;
             enemies[k].alive = 1;
             break;
         }
@@ -1330,6 +1515,7 @@ int main(void) {
     int bossOn = 0;
 
     initVideo();
+    srand(VSync(-1));   /* [FIX] seed RNG - sebelumnya tidak pernah di-seed sama sekali */
     initStars();
 
     FntLoad(960, 0);
@@ -1394,8 +1580,7 @@ int main(void) {
             if (connected[0]) {
                 static const uint16_t code[10] = { PAD_UP, PAD_UP, PAD_DOWN, PAD_DOWN,
                     PAD_LEFT, PAD_RIGHT, PAD_LEFT, PAD_RIGHT, PAD_CIRCLE, PAD_CROSS };
-                uint16_t newly = (uint16_t)(~btn[0] & prevBtn[0] ? 0 : 0);
-                (void)newly;
+                /* [FIX] dead code sisa debug dihapus (dulu ada `newly` yang selalu 0) */
                 uint16_t down = (uint16_t)(~btn[0]);           /* bit 1 = ditekan */
                 uint16_t wasUp = prevBtn[0];                   /* bit 1 = tidak ditekan sebelumnya */
                 uint16_t fresh = down & wasUp;                 /* baru ditekan frame ini */
@@ -1440,10 +1625,10 @@ int main(void) {
                 if (!pl->alive || !connected[p]) continue;
 
                 uint16_t b = btn[p];
-                if (!(b & PAD_LEFT)  && pl->x > 0)             pl->x -= 3;
-                if (!(b & PAD_RIGHT) && pl->x < SCREEN_W - 16) pl->x += 3;
-                if (!(b & PAD_UP)    && pl->y > HUD_H + 16)    pl->y -= 2;
-                if (!(b & PAD_DOWN)  && pl->y < SCREEN_H - 24) pl->y += 2;
+                if (!(b & PAD_LEFT)  && pl->x > 0)                     pl->x -= 3;
+                if (!(b & PAD_RIGHT) && pl->x < SCREEN_W - PLAYER_W)   pl->x += 3;
+                if (!(b & PAD_UP)    && pl->y > HUD_H + 16)            pl->y -= 2;
+                if (!(b & PAD_DOWN)  && pl->y < SCREEN_H - 24)         pl->y += 2;
 
                 if (pl->cooldown > 0) pl->cooldown--;
                 if (!(b & PAD_CROSS) && pl->cooldown == 0) {
@@ -1478,6 +1663,7 @@ int main(void) {
                     e->y = HUD_H + 2;
                     e->t = rand() % 32;
                     e->vx = 0;
+                    e->vy = 0; e->tx = 0; e->ty = 0; e->buff = 0;   /* [FIX] reset field baru, cegah leftover dari slot lama */
                     switch (e->type) {
                         case E_TANK:       e->hp = 4; e->shield = 0; e->timer = 0;  break;
                         case E_SHOOTER:    e->hp = 2; e->shield = 0; e->timer = 40; break;
@@ -1488,6 +1674,13 @@ int main(void) {
                         case E_JUGGERNAUT: e->hp = 8; e->shield = 0; e->timer = 0;  break;
                         case E_NOVA:       e->hp = 2; e->shield = 0; e->timer = 0;  break;
                         case E_STINGER:    e->hp = 1; e->shield = 0; e->timer = 0; e->vx = 0; break;
+                        /* [BARU] 6 musuh baru */
+                        case E_TURRET:     e->hp = 5;  e->shield = 0; e->timer = 0;   e->vx = 0; break;
+                        case E_MINELAYER:  e->hp = 3;  e->shield = 0; e->timer = 60;  e->vx = (rand() & 1) ? 2 : -2; break;
+                        case E_CHARGER:    e->hp = 2;  e->shield = 0; e->timer = 0;   break;
+                        case E_MIRROR:     e->hp = 3;  e->shield = 0; e->timer = 0;   e->vx = (rand() & 1) ? 1 : -1; break;
+                        case E_HEALER:     e->hp = 4;  e->shield = 0; e->timer = 100; e->vx = (rand() & 1) ? 1 : -1; break;
+                        case E_ABSORBER:   e->hp = 10; e->shield = 0; e->timer = 0;   e->vx = 0; break;
                         default:           e->hp = 1; e->shield = 0; e->timer = 0;  break;
                     }
                     if (e->type != E_SHARD && nPlayers > 1) e->hp += (nPlayers - 1) / 2;
@@ -1513,6 +1706,7 @@ int main(void) {
                     enemies[i].shield = 0;
                     enemies[i].timer = 0;
                     enemies[i].vx = 0;
+                    enemies[i].vy = 0; enemies[i].tx = 0; enemies[i].ty = 0; enemies[i].buff = 0;
                     enemies[i].alive = 1;
                     bossOn = 1;
                     break;
@@ -1532,10 +1726,13 @@ int main(void) {
                 bullets[i].x += bullets[i].dx;
                 if (bullets[i].y < HUD_H) bullets[i].alive = 0;
             }
+            /* [FIX] EBullet sekarang bergerak dengan vx,vy (bisa diagonal/aim) */
             for (int i = 0; i < MAX_EBULLETS; i++) {
                 if (!ebullets[i].alive) continue;
+                ebullets[i].x += ebullets[i].vx;
                 ebullets[i].y += ebullets[i].vy;
-                if (ebullets[i].y > SCREEN_H) ebullets[i].alive = 0;
+                if (ebullets[i].y > SCREEN_H || ebullets[i].y < -20 ||
+                    ebullets[i].x < -20 || ebullets[i].x > SCREEN_W + 20) ebullets[i].alive = 0;
             }
             for (int i = 0; i < MAX_ITEMS; i++) {
                 if (!items[i].alive) continue;
@@ -1554,6 +1751,7 @@ int main(void) {
 
                 int tgt = nearestPlayer(e->x, e->y);
                 int tx = (tgt >= 0) ? players[tgt].x : SCREEN_W / 2;
+                int ty = (tgt >= 0) ? players[tgt].y : HUD_H + 100;   /* [BARU] target Y, dipakai Turret & Charger */
 
                 switch (e->type) {
                 case E_BOSS:
@@ -1579,7 +1777,7 @@ int main(void) {
                     if (e->y < HUD_H + 50) e->y += 1;
                     else {
                         if (e->timer > 0) e->timer--;
-                        else { spawnEBullet(e->x + 9, e->y + 18); e->timer = 60; }
+                        else { spawnEBullet(e->x + 9, e->y + 18, 0, 3); e->timer = 60; }
                     }
                     break;
                 case E_SPLITTER:
@@ -1624,6 +1822,76 @@ int main(void) {
                 case E_NOVA:
                     e->y += baseSpeed;
                     break;
+
+                /* [BARU] logika gerak 6 musuh baru */
+                case E_TURRET:
+                    if (!e->vx) {
+                        e->y += 1;
+                        if (e->y >= HUD_H + 40) { e->y = HUD_H + 40; e->vx = 1; e->timer = 40; }
+                    } else if (tgt >= 0) {
+                        if (e->timer > 0) e->timer--;
+                        else {
+                            int avx, avy;
+                            aimVector(e->x + 11, e->y + 10, tx + 8, ty + 8, 3, &avx, &avy);
+                            spawnEBullet(e->x + 9, e->y + 18, avx, avy);
+                            e->timer = 75 - level * 4;
+                            if (e->timer < 25) e->timer = 25;
+                        }
+                    }
+                    break;
+
+                case E_MINELAYER:
+                    e->y += 1;
+                    e->x += e->vx;
+                    if (e->x < 4) { e->x = 4; e->vx = -e->vx; }
+                    if (e->x > SCREEN_W - 24) { e->x = SCREEN_W - 24; e->vx = -e->vx; }
+                    if (--e->timer <= 0) { spawnMine(e->x + 9, e->y + 18); e->timer = 70; }
+                    break;
+
+                case E_CHARGER:
+                    if (e->shield == 0) {
+                        e->y += baseSpeed + 1;
+                        if (e->y > HUD_H + 40) { e->shield = 1; e->timer = 35; e->tx = tx; e->ty = ty; }
+                    } else if (e->shield == 1) {
+                        if (--e->timer <= 0) {
+                            int avx, avy;
+                            aimVector(e->x + 8, e->y + 9, e->tx, e->ty, 6, &avx, &avy);
+                            e->vx = avx; e->vy = avy;
+                            e->shield = 2; e->timer = 40;
+                        }
+                    } else {
+                        e->x += e->vx; e->y += e->vy;
+                        if (--e->timer <= 0 || e->y > SCREEN_H || e->x < -20 || e->x > SCREEN_W + 20)
+                            e->alive = 0;
+                    }
+                    break;
+
+                case E_MIRROR:
+                    e->y += baseSpeed;
+                    e->x += e->vx;
+                    if (e->x < 0 || e->x > SCREEN_W - 16) e->vx = -e->vx;
+                    break;
+
+                case E_HEALER:
+                    e->y += 1;
+                    e->x += e->vx;
+                    if (e->x < 0 || e->x > SCREEN_W - 18) e->vx = -e->vx;
+                    if (--e->timer <= 0) {
+                        for (int k = 0; k < MAX_ENEMIES; k++) {
+                            if (!enemies[k].alive || &enemies[k] == e) continue;
+                            if (enemies[k].type == E_BOSS || enemies[k].type == E_HEALER || enemies[k].type == E_SHARD) continue;
+                            int dxh = enemies[k].x - e->x, dyh = enemies[k].y - e->y;
+                            if (dxh * dxh + dyh * dyh <= 70 * 70 && enemies[k].buff < 3) enemies[k].buff++;
+                        }
+                        spawnSparks(e->x + 9, e->y + 9, 10, 120, 255, 160, 1);
+                        e->timer = 130;
+                    }
+                    break;
+
+                case E_ABSORBER:
+                    if (e->y < HUD_H + 30) e->y += 1;
+                    break;
+
                 default:
                     e->y += baseSpeed;
                     break;
@@ -1641,7 +1909,18 @@ int main(void) {
                         spawnSparks(bullets[j].x + 2, bullets[j].y, 3, 160, 120, 255, 0);
                         continue;
                     }
-                    if (e->type != E_PHANTOM && e->shield > 0) {
+
+                    /* [BARU] lapisan buff dari Healer, berlaku universal, dicek sebelum shield asli */
+                    if (e->buff > 0) {
+                        e->buff--;
+                        spawnSparks(bullets[j].x + 2, bullets[j].y, 4, 140, 255, 180, 0);
+                        continue;
+                    }
+
+                    /* [FIX] Charger & Mirror numpang field `shield` untuk hal LAIN (state/flag),
+                       bukan shield sungguhan - wajib dikecualikan di sini, kalau tidak mereka akan
+                       salah dianggap "menyerap peluru tanpa rusak" oleh cek generic di bawah ini. */
+                    if (e->type != E_PHANTOM && e->type != E_CHARGER && e->type != E_MIRROR && e->shield > 0) {
                         e->shield--;
                         spawnSparks(bullets[j].x + 2, bullets[j].y, 4, 100, 200, 255, 0);
                         continue;
@@ -1653,7 +1932,23 @@ int main(void) {
                             maxPow = players[p].powerStack;
                     e->hp -= dmgBase + maxPow;
 
+                    /* [BARU] Mirror pecah SEKALI saat kena hit pertama, bukan saat mati */
+                    if (e->type == E_MIRROR && e->shield == 0) {
+                        e->shield = 1;
+                        spawnMirrorClone(e->x, e->y);
+                    }
+
                     spawnSparks(bullets[j].x + 2, bullets[j].y, 4, 120, 230, 255, 0);
+
+                    /* [BARU] Absorber charge & retaliate */
+                    if (e->type == E_ABSORBER && e->hp > 0) {
+                        e->timer++;
+                        if (e->timer >= ABSORBER_CHARGE) {
+                            e->timer = 0;
+                            absorberRetaliate(e->x + 11, e->y + 11);
+                        }
+                    }
+
                     if (e->hp <= 0) {
                         spawnExplosion(e->x + w / 2, e->y + h / 2,
                                        e->type == E_BOSS || e->type == E_TANK || e->type == E_JUGGERNAUT);
@@ -1663,8 +1958,9 @@ int main(void) {
 
                         int pts = 1;
                         if (e->type == E_BOSS) pts = 10;
-                        else if (e->type == E_JUGGERNAUT) pts = 4;
-                        else if (e->type == E_TANK || e->type == E_SHIELDED || e->type == E_NOVA) pts = 3;
+                        else if (e->type == E_ABSORBER || e->type == E_JUGGERNAUT) pts = 4;
+                        else if (e->type == E_TANK || e->type == E_SHIELDED || e->type == E_NOVA || e->type == E_HEALER) pts = 3;
+                        else if (e->type == E_TURRET || e->type == E_MINELAYER || e->type == E_CHARGER) pts = 2;
                         else if (e->type == E_SPLITTER || e->type == E_SHOOTER || e->type == E_SPINNER ||
                                  e->type == E_STINGER || e->type == E_ORBITER || e->type == E_PHANTOM) pts = 2;
 
@@ -1706,7 +2002,7 @@ int main(void) {
 
                     int phantomImmune = (e->type == E_PHANTOM && e->shield == 0);
                     if (!phantomImmune && pl->invuln == 0 && pl->shieldStack == 0 &&
-                        overlap(pl->x, pl->y, 16, 16, e->x, e->y, w, h)) {
+                        overlap(pl->x, pl->y, PLAYER_W, PLAYER_H, e->x, e->y, w, h)) {
                         spawnExplosion(e->x + w / 2, e->y + h / 2, 0);
                         if (e->type != E_BOSS) e->alive = 0;
                         hurtPlayer(p);
@@ -1795,7 +2091,7 @@ int main(void) {
                     for (int p = 0; p < MAX_PLAYERS; p++) {
                         Player *pl = &players[p];
                         if (!pl->active || !pl->alive || pl->invuln > 0 || pl->shieldStack > 0) continue;
-                        if (overlap(pl->x, pl->y, 16, 16, mad.x - 6, mad.y, 62, 42)) hurtPlayer(p);
+                        if (overlap(pl->x, pl->y, PLAYER_W, PLAYER_H, mad.x - 6, mad.y, 62, 42)) hurtPlayer(p);
                     }
                 }
             }
@@ -1820,7 +2116,7 @@ int main(void) {
                 for (int p = 0; p < MAX_PLAYERS; p++) {
                     Player *pl = &players[p];
                     if (!pl->active || !pl->alive) continue;
-                    if (!overlap(pl->x, pl->y, 16, 16, missiles[i].x - 3, missiles[i].y - 3, 8, 10)) continue;
+                    if (!overlap(pl->x, pl->y, PLAYER_W, PLAYER_H, missiles[i].x - 3, missiles[i].y - 3, 8, 10)) continue;
                     missiles[i].alive = 0;
                     spawnExplosion(missiles[i].x, missiles[i].y, 0);
                     if (pl->shieldStack == 0 && pl->invuln == 0) hurtPlayer(p);
@@ -1849,6 +2145,42 @@ int main(void) {
                 }
             }
 
+            /* [BARU] mine dari musuh Minelayer: bisa ditembak, bisa trigger jarak dekat, atau timeout */
+            for (int i = 0; i < MAX_MINES; i++) {
+                if (!mines[i].alive) continue;
+                int triggered = 0;
+
+                for (int j = 0; j < MAX_BULLETS; j++) {
+                    if (!bullets[j].alive) continue;
+                    if (!overlap(bullets[j].x, bullets[j].y, 4, 14, mines[i].x - 5, mines[i].y - 5, 10, 10)) continue;
+                    bullets[j].alive = 0;
+                    triggered = 1;
+                    break;
+                }
+
+                if (!triggered && mines[i].timer < MINE_ARM_AT) {
+                    for (int p = 0; p < MAX_PLAYERS; p++) {
+                        Player *pl = &players[p];
+                        if (!pl->active || !pl->alive) continue;
+                        int dx = pl->x + 8 - mines[i].x, dy = pl->y + 8 - mines[i].y;
+                        if (dx * dx + dy * dy <= 22 * 22) { triggered = 1; break; }
+                    }
+                }
+
+                if (--mines[i].timer <= 0) triggered = 1;
+
+                if (triggered) {
+                    spawnExplosion(mines[i].x, mines[i].y, 0);
+                    for (int p = 0; p < MAX_PLAYERS; p++) {
+                        Player *pl = &players[p];
+                        if (!pl->active || !pl->alive || pl->invuln > 0 || pl->shieldStack > 0) continue;
+                        int dx = pl->x + 8 - mines[i].x, dy = pl->y + 8 - mines[i].y;
+                        if (dx * dx + dy * dy <= 30 * 30) hurtPlayer(p);
+                    }
+                    mines[i].alive = 0;
+                }
+            }
+
             /* laser boss: peringatan lalu menembak 1,8 detik, lalu hilang */
             for (int i = 0; i < MAX_MLASERS; i++) {
                 if (!mlasers[i].alive) continue;
@@ -1867,7 +2199,7 @@ int main(void) {
                 for (int p = 0; p < MAX_PLAYERS; p++) {
                     Player *pl = &players[p];
                     if (!pl->active || !pl->alive) continue;
-                    if (!overlap(pl->x, pl->y, 16, 16, ebullets[i].x, ebullets[i].y, 3, 9)) continue;
+                    if (!overlap(pl->x, pl->y, PLAYER_W, PLAYER_H, ebullets[i].x, ebullets[i].y, 3, 9)) continue;
                     ebullets[i].alive = 0;
                     if (pl->shieldStack > 0) {
                         spawnSparks(ebullets[i].x, ebullets[i].y, 3, 100, 200, 255, 0);
@@ -1898,7 +2230,7 @@ int main(void) {
                 for (int p = 0; p < MAX_PLAYERS; p++) {
                     Player *pl = &players[p];
                     if (!pl->active || !pl->alive) continue;
-                    if (overlap(pl->x, pl->y, 16, 16, items[i].x, items[i].y, 10, 10)) {
+                    if (overlap(pl->x, pl->y, PLAYER_W, PLAYER_H, items[i].x, items[i].y, 10, 10)) {
                         applyItem(pl, items[i].type);
                         spawnSparks(items[i].x + 5, items[i].y + 5, 5, 200, 255, 200, 0);
                         items[i].alive = 0;
@@ -1965,6 +2297,10 @@ int main(void) {
 
             for (int i = 0; i < MAX_ITEMS; i++)
                 if (items[i].alive) drawItem(&items[i], frame);
+
+            /* [BARU] gambar mine milik Minelayer */
+            for (int i = 0; i < MAX_MINES; i++)
+                if (mines[i].alive) drawMine(&mines[i], frame);
 
             /* [MAD] gambar boss rahasia dan serangannya */
             if (mad.alive) {

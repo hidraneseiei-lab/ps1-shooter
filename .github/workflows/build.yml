@@ -1,40 +1,57 @@
-name: Build PS1
+name: Build PS1 Shooter Game
 
 on:
   push:
-  workflow_dispatch:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+    - name: Checkout Code
+      uses: actions/checkout@v4
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake ninja-build
+    - name: Install Build Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake ninja-build build-essential wget unzip genisoimage
 
-      - name: Download PSn00bSDK
-        run: |
-          curl -L -o psn00bsdk.zip https://github.com/Lameguy64/PSn00bSDK/releases/download/v0.24/PSn00bSDK-0.24-Linux.zip
-          unzip -q psn00bsdk.zip -d $HOME/psn00bsdk
-          echo "PSN00BSDK_LIBS=$HOME/psn00bsdk/lib/libpsn00b" >> $GITHUB_ENV
-          echo "$HOME/psn00bsdk/bin" >> $GITHUB_PATH
+    - name: Download and Setup PSn00bSDK
+      run: |
+        # Buat folder pusat untuk SDK
+        sudo mkdir -p /opt/psn00bsdk
+        
+        # Unduh rilisan resmi PSn00bSDK untuk arsitektur Linux
+        wget https://github.com
+        
+        # Ekstrak file langsung ke dalam direktori /opt/psn00bsdk
+        sudo unzip PSn00bSDK-0.24-Linux.zip -d /opt/psn00bsdk
+        
+        # Berikan izin akses penuh ke folder agar proses eksekusi tidak tertahan permission
+        sudo chmod -R 777 /opt/psn00bsdk
 
-      - name: Build
-        run: |
-          cmake -B build -G Ninja \
-            -DCMAKE_TOOLCHAIN_FILE=$HOME/psn00bsdk/lib/libpsn00b/cmake/sdk.cmake \
-            -DPSN00BSDK_TC=$HOME/psn00bsdk/bin \
-            .
-          cmake --build build
+    - name: Run CMake Configuration & Build
+      run: |
+        # Daftarkan folder biner MIPS GCC bawaan SDK ke $PATH sistem GitHub Actions
+        export PATH="/opt/psn00bsdk/bin:$PATH"
+        
+        # Set variabel lingkungan penunjuk pustaka inti internal PSn00bSDK
+        export PSN00BSDK_LIBS="/opt/psn00bsdk/lib/libpsn00b"
+        
+        # Jalankan CMake dengan konfigurasi mengarah ke file generator Ninja dan letak sdk.cmake yang tepat
+        cmake -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=/opt/psn00bsdk/lib/libpsn00b/cmake/sdk.cmake .
+        
+        # Eksekusi kompilasi kode program C menjadi executable PS1
+        cmake --build build
 
-      - name: Upload result
-        uses: actions/upload-artifact@v4
-        with:
-          name: ps1-game
-          path: |
-            build/shooter.bin
-            build/shooter.cue
-            build/shooter.exe
+    - name: Upload Finished PS1 ISO
+      uses: actions/upload-artifact@v4
+      with:
+        name: ps1-shooter-game-disc
+        path: |
+          build/*.iso
+          build/*.bin
+          build/*.cue

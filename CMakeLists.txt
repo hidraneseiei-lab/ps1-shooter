@@ -8,4 +8,4 @@ project(
 )
 
 psn00bsdk_add_executable(shooter GPREL main.c)
-psn00bsdk_add_cd_image(iso shooter iso.xml DEPENDS shooter system.cnf)
+psn00bsdk_add_cd_image(iso shooter iso.xml DEPENDS shooter ${PROJECT_SOURCE_DIR}/system.cnf)

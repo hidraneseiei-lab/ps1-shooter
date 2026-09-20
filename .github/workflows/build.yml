@@ -24,8 +24,11 @@ jobs:
 
       - name: Build
         run: |
-          cmake --preset default .
-          cmake --build ./build
+          cmake -B build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=$HOME/psn00bsdk/lib/libpsn00b/cmake/sdk.cmake \
+            -DPSN00BSDK_TC=$HOME/psn00bsdk/bin \
+            .
+          cmake --build build
 
       - name: Upload result
         uses: actions/upload-artifact@v4

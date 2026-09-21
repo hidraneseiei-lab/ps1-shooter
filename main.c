@@ -4,8 +4,9 @@
 #include <psxgpu.h>
 #include <psxpad.h>
 #include <psxapi.h>
+#include "audio.h"
 
-#define OT_LEN     9
+#define OT_LEN     10
 #define BUFFER_LEN 131072
 #define SCREEN_W   320
 #define SCREEN_H   240
@@ -29,8 +30,8 @@ static uint16_t prevBtn[MAX_PLAYERS] = { 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF };
 #define PLAYER_W 16
 #define PLAYER_H 16
 
-enum { L_HUD_TOP = 0, L_HUD_BASE = 1, L_GLOW = 2, L_FX = 3, L_PLAYER = 4,
-       L_BULLET = 5, L_ENEMY = 6, L_PLANET = 7, L_BG = 8 };
+enum { L_OVERLAY = 0, L_HUD_TOP = 1, L_HUD_BASE = 2, L_GLOW = 3, L_FX = 4, L_PLAYER = 5,
+       L_BULLET = 6, L_ENEMY = 7, L_PLANET = 8, L_BG = 9 };
 
 /* [FIX] Enemy: tambah vy, tx, ty, buff untuk kebutuhan 6 musuh baru
    (vy/tx/ty dipakai Charger buat simpan arah & target dash,
@@ -179,6 +180,9 @@ static int pressedP(int pl, uint16_t btn, uint16_t mask) {
     return !(btn & mask) && (prevBtn[pl] & mask);
 }
 
+/* offset DRAWENV asli tiap buffer (posisi di VRAM). Shake ditambahkan ke ini, tidak menggantikan. */
+static int16_t baseOfs[2][2];
+
 static void initVideo(void) {
     ResetGraph(0);
     SetDefDispEnv(&buffers[0].disp, 0, 0,        SCREEN_W, SCREEN_H);
@@ -189,6 +193,8 @@ static void initVideo(void) {
         setRGB0(&buffers[i].draw, 0, 0, 0);
         buffers[i].draw.isbg = 1;
         buffers[i].draw.dtd  = 1;
+        baseOfs[i][0] = buffers[i].draw.ofs[0];
+        baseOfs[i][1] = buffers[i].draw.ofs[1];
     }
     active = 0;
     PutDispEnv(&buffers[0].disp);
@@ -207,16 +213,86 @@ static void flip(void) {
     nextpri = buffers[active].buf;
 }
 
+/* =====================================================================
+   [FASE 3] Efek layar: screen shake, flash, fade transisi
+   Semua state ada di sini. Dipanggil dari main():
+     fxUpdate()      1x per frame (sebelum menggambar)
+     fxApplyShake()  1x per frame tepat sebelum flip() -> geser DRAWENV.ofs
+     fxDraw()        1x per frame setelah semua gambar -> overlay flash/fade
+   ===================================================================== */
+static int shakeMag  = 0;     /* amplitudo shake saat ini (piksel) */
+static int flashT    = 0;     /* sisa frame flash putih */
+static int flashMax  = 1;
+static int fadeDir   = 0;     /* -1 = fade in (terang), +1 = fade out (gelap), 0 = diam */
+static int fadeLevel = 255;   /* 0 = terang penuh, 255 = hitam penuh */
+static int fadePending = -1;  /* state tujuan setelah fade out selesai (-1 = tidak ada) */
+static int fxTick    = 0;     /* pencacah internal untuk peluruhan shake */
+
+#define SHAKE_MAX   6
+#define FADE_SPEED  24
+
+static void fxShake(int mag) {
+    if (mag > shakeMag) shakeMag = mag > SHAKE_MAX ? SHAKE_MAX : mag;
+}
+#define FLASH_COOLDOWN 28      /* jeda minimal (frame) antar flash => maks ~2 kilat/detik (aman fotosensitif) */
+static int flashCool = 0;
+static void fxFlash(int frames) {
+    if (flashCool > 0 && frames < 10) return;   /* flash kecil diabaikan bila baru saja flash */
+    flashT = frames; flashMax = frames > 0 ? frames : 1;
+    flashCool = FLASH_COOLDOWN + frames;
+}
+
+static void fxFadeTo(int newState) { fadePending = newState; fadeDir = 1; }
+static void fxFadeInNow(void)      { fadeLevel = 255; fadeDir = -1; }
+
+/* return: 1 bila fade out selesai & state harus berganti, dengan *outState terisi */
+static int fxUpdate(int *outState) {
+    int switched = 0;
+    /* shake meluruh 1 piksel tiap 2 frame agar terasa "getar lalu reda", bukan langsung hilang */
+    if (shakeMag > 0 && (fxTick++ & 1)) shakeMag--;
+    if (flashT > 0) flashT--;
+    if (flashCool > 0) flashCool--;
+
+    if (fadeDir > 0) {
+        fadeLevel += FADE_SPEED;
+        if (fadeLevel >= 255) {
+            fadeLevel = 255;
+            if (fadePending >= 0) { *outState = fadePending; switched = 1; }
+            fadePending = -1;
+            fadeDir = -1;              /* langsung lanjut fade in di state baru */
+        }
+    } else if (fadeDir < 0) {
+        fadeLevel -= FADE_SPEED;
+        if (fadeLevel <= 0) { fadeLevel = 0; fadeDir = 0; }
+    }
+    return switched;
+}
+
+static int shakeOffsetX(int frame) { return shakeMag ? ((frame & 1) ? shakeMag : -shakeMag) : 0; }
+static void fxApplyShake(int frame);   /* didefinisikan setelah baseOfs & buffers tersedia */
+static int shakeOffsetY(int frame) { return shakeMag ? (((frame >> 1) & 1) ? shakeMag / 2 + 1 : -(shakeMag / 2 + 1)) : 0; }
+
 /* ---------- Primitif dasar ---------- */
 
 /* [FIX] semua alokasi primitif disentralisasi lewat primAlloc() supaya ada
    bound-check terhadap BUFFER_LEN. Sebelumnya nextpri ditambah tanpa cek sama
    sekali -> berisiko overflow diam-diam & merusak struct RenderBuffer lain. */
+/* [FASE 3] 2 KB terakhir buffer dicadangkan khusus untuk overlay (fade/flash) supaya
+   transisi layar tidak pernah gagal tergambar, walau adegan sedang sangat padat. */
+#define PRIM_RESERVE 2048
+static int primOverlayMode = 0;    /* 1 = sedang menggambar overlay: boleh pakai cadangan */
+static int primPeak = 0;           /* pemakaian puncak (byte) sejak boot, untuk debug */
+
 static void *primAlloc(int size) {
     uint8_t *base = buffers[active].buf;
-    if (nextpri + size > base + BUFFER_LEN) return NULL; /* buffer penuh, skip gambar drpd corrupt memory */
+    int limit = BUFFER_LEN - (primOverlayMode ? 0 : PRIM_RESERVE);
+    if (nextpri + size > base + limit) return NULL; /* penuh: lewati gambar daripada merusak memori */
     void *p = nextpri;
     nextpri += size;
+    {
+        int used = (int)(nextpri - base);
+        if (used > primPeak) primPeak = used;
+    }
     return p;
 }
 
@@ -394,6 +470,33 @@ static void quarterDisc(int layer, int cx, int cy, int rad, int q,
     }
 }
 
+/* [FASE 3] penerap shake: tambahkan offset ke offset DASAR buffer yang sedang digambar.
+   Dipanggil tepat sebelum flip() (flip memakai buffers[active].draw). */
+static void fxApplyShake(int frame) {
+    buffers[active].draw.ofs[0] = baseOfs[active][0] + shakeOffsetX(frame);
+    buffers[active].draw.ofs[1] = baseOfs[active][1] + shakeOffsetY(frame);
+}
+
+/* [FASE 3] overlay flash putih (additive) + fade hitam. Panggil PALING AKHIR sebelum flip(). */
+static void fxDraw(void) {
+    primOverlayMode = 1;
+    /* Karena ofs bergeser saat shake, gambar overlay sedikit lebih besar dari layar. */
+    const int m = SHAKE_MAX + 2;
+    if (flashT > 0) {
+        int a = flashT * 200 / flashMax;
+        flatRect(L_OVERLAY, -m, -m, SCREEN_W + 2 * m, SCREEN_H + 2 * m, a, a, a, 1);
+        setBlendMode(L_OVERLAY, 1);      /* additive: menambah terang, tidak menutupi */
+    }
+    if (fadeLevel > 0) {
+        int a = fadeLevel;
+        /* fade hitam pakai subtractive?  -> lebih sederhana: kotak hitam opaque dengan
+           skala warna lewat mode 2 (kurangi). Kurangi (a,a,a) dari piksel = gelap merata. */
+        flatRect(L_OVERLAY, -m, -m, SCREEN_W + 2 * m, SCREEN_H + 2 * m, a, a, a, 1);
+        setBlendMode(L_OVERLAY, 2);      /* subtractive: mengurangi terang = memudar ke hitam */
+    }
+    primOverlayMode = 0;
+}
+
 static void roundedPanel(int layer, int x, int y, int w, int h, int rad,
                          int r, int g, int b, int trans) {
     flatRect(layer, x + rad, y, w - 2 * rad, h, r, g, b, trans);
@@ -438,13 +541,34 @@ static void initStars(void) {
     }
 }
 
-static void drawStars(int frame) {
+/* [FASE 3] Bintang 3 lapis parallax dengan bentuk berbeda (dan lebih murah dari discLo 8 segitiga):
+     lapis 0 (jauh)  : titik 1x1 redup           -> 1 TILE      (12 byte)
+     lapis 1 (tengah): tanda '+' kecil berkelip   -> 2 TILE      (24 byte)
+     lapis 2 (dekat) : bintang besar + ekor gerak -> 1 G3 + TILE (40 byte)
+   'speedBoost' menambah panjang ekor (dipakai saat pemain bergerak/boss agar terasa cepat). */
+static void drawStars(int frame, int speedBoost) {
     for (int i = 0; i < NUM_STARS; i++) {
-        int tw   = 140 + sinS(frame + stars[i].phase) / 2;
-        int rad  = stars[i].layer + 1;
-        int tint = (stars[i].layer == 2) ? 40 : 0;
-        discLo(L_PLANET, stars[i].x, stars[i].y, rad,
-               tw, tw, tw + tint, tw / 3, tw / 3, tw / 3);
+        int x = stars[i].x, y = stars[i].y;
+        int tw = 140 + sinS(frame + stars[i].phase) / 2;
+        switch (stars[i].layer) {
+        case 0:
+            rect(L_PLANET, x, y, 1, 1, tw / 2, tw / 2, tw / 2 + 20);
+            break;
+        case 1: {
+            int v = tw * 3 / 4;
+            rect(L_PLANET, x - 1, y, 3, 1, v, v, v);
+            rect(L_PLANET, x, y - 1, 1, 3, v, v, v);
+            break;
+        }
+        default: {
+            int tail = 4 + speedBoost * 2;
+            tri(L_PLANET, x, y, tw, tw, 255,
+                          x - 1, y - tail, 0, 0, 0,
+                          x + 1, y - tail, 0, 0, 0);
+            rect(L_PLANET, x - 1, y - 1, 2, 2, 255, 255, 255);
+            break;
+        }
+        }
     }
 }
 
@@ -467,26 +591,99 @@ static void drawShootingStar(void) {
 
 /* ---------- Latar ---------- */
 
+/* [FASE 3] Tema latar per stage. Tiap 2 level ganti tema; warna diinterpolasi halus. */
+typedef struct {
+    int neb1R, neb1G, neb1B;      /* warna nebula grup A (kiri atas) */
+    int neb2R, neb2G, neb2B;      /* warna nebula grup B (kanan bawah) */
+    int topR, topG, topB;         /* gradien langit atas */
+    int botR, botG, botB;         /* gradien langit bawah */
+    int planR, planG, planB;      /* warna planet besar */
+    int cloudR, cloudG, cloudB;   /* warna awan/debu parallax */
+} Theme;
+
+#define NUM_THEMES 5
+static const Theme themes[NUM_THEMES] = {
+    /* 1 UNGU-BIRU (asli)  */ {  40,10,60,   8,45,55,    20,6,44,   2,4,20,    255,210,150,  90,70,130 },
+    /* 2 HIJAU TOKSIK      */ {  10,60,30,  30,55,10,    6,30,18,   2,12,8,    190,255,140,  60,120,70 },
+    /* 3 MERAH MEMBARA     */ {  70,15,10,  60,30,5,     40,8,8,    16,2,4,    255,160,110,  140,60,50 },
+    /* 4 BIRU ES           */ {  10,40,80,  20,70,90,    6,20,52,   2,8,24,    170,230,255,  70,110,150 },
+    /* 5 EMAS BADAI        */ {  70,50,10,  80,20,60,    44,26,6,   18,6,12,   255,230,140,  150,110,60 },
+};
+
+/* themeFor memperlakukan Theme sebagai array int. Pastikan tak ada padding/field non-int. */
+_Static_assert(sizeof(Theme) == 18 * sizeof(int), "Theme harus 18 int murni (tanpa padding)");
+
+/* interpolasi linear satu warna; t dalam 0..256 */
+static int lerpI(int a, int b, int t) { return a + (b - a) * t / 256; }
+
+/* [FASE 3] Tema TEGAS per pasang level (1-2, 3-4, 5-6, 7-8, 9-10).
+   Peralihan halus dilakukan lewat crossfade sebenarnya: 'themeMix' (0..256) menahan
+   tema lama lalu meluncur ke tema baru selama ~1 detik setiap kali level naik. */
+static int themePrev = 0;      /* indeks tema sebelum berganti */
+static int themeCur  = 0;      /* indeks tema tujuan */
+static int themeMix  = 256;    /* 0 = tema lama penuh, 256 = tema baru penuh */
+
+static void themeSetLevel(int level, int instant) {
+    int idx = (level - 1) / 2;
+    if (idx >= NUM_THEMES) idx = NUM_THEMES - 1;
+    if (idx < 0) idx = 0;
+    if (idx == themeCur) return;
+    themePrev = themeCur;
+    themeCur  = idx;
+    themeMix  = instant ? 256 : 0;
+}
+
+static void themeUpdate(void) {
+    if (themeMix < 256) { themeMix += 5; if (themeMix > 256) themeMix = 256; }   /* ~51 frame = 0,85 dtk */
+}
+
+static void themeFor(int frame, Theme *out) {
+    const int *A = (const int *)&themes[themePrev];
+    const int *B = (const int *)&themes[themeCur];
+    int *O = (int *)out;
+    int breathe = sinS(frame / 12) / 24;             /* denyut halus supaya latar tetap hidup */
+    for (int i = 0; i < (int)(sizeof(Theme) / sizeof(int)); i++) {
+        int v = lerpI(A[i], B[i], themeMix) + (i < 6 ? breathe : 0);   /* denyut hanya di warna nebula */
+        O[i] = v < 0 ? 0 : (v > 255 ? 255 : v);
+    }
+}
+
 static void drawBackground(int frame) {
+    Theme th;
+    themeFor(frame, &th);
+
+    /* --- planet besar & planet kecil (parallax lambat) --- */
     int py = (frame / 5) % (SCREEN_H + 140) - 70;
     int px = 250;
-
     tri(L_PLANET, px - 48, py + 3, 210, 180, 230,  px + 48, py - 3, 210, 180, 230,  px, py + 10, 100, 70, 140);
     tri(L_PLANET, px - 48, py + 3, 210, 180, 230,  px + 48, py - 3, 210, 180, 230,  px, py - 8, 150, 120, 190);
-    planetSphere(px, py, 30, 255, 210, 150, 40, 25, 60);
-    disc(L_PLANET, px - 8, py - 8, 12, 255, 240, 200, 255, 200, 120);
+    planetSphere(px, py, 30, th.planR, th.planG, th.planB, th.planR / 6, th.planG / 8, th.planB / 4);
+    disc(L_PLANET, px - 8, py - 8, 12, 255, 240, 200, th.planR, th.planG * 3 / 4, th.planB / 2);
 
     int py2 = (frame / 8 + 100) % (SCREEN_H + 80) - 40;
     planetSphere(40, py2, 14, 220, 245, 255, 20, 50, 120);
 
+    /* --- nebula (tema) --- */
     int pulse = 14 + sinS(frame / 6) / 14;
-    disc(L_BG, 70, 80, 70,  pulse + 40, 10, pulse + 60,  16, 6, 34);
-    disc(L_BG, 110, 60, 50, pulse + 50, 20, pulse + 70,  16, 6, 34);
-    disc(L_BG, 260, 160, 70, 8, pulse + 45, pulse + 55,  6, 10, 34);
-    disc(L_BG, 230, 180, 50, 12, pulse + 55, pulse + 60, 6, 10, 34);
+    disc(L_BG, 70, 80, 70,  th.neb1R + pulse, th.neb1G, th.neb1B + pulse,  th.topR, th.topG, th.topB);
+    disc(L_BG, 110, 60, 50, th.neb1R + pulse + 10, th.neb1G + 10, th.neb1B + pulse + 10,  th.topR, th.topG, th.topB);
+    disc(L_BG, 260, 160, 70, th.neb2R, th.neb2G + pulse, th.neb2B + pulse,  th.botR, th.botG, th.botB);
+    disc(L_BG, 230, 180, 50, th.neb2R + 4, th.neb2G + pulse + 10, th.neb2B + pulse + 5,  th.botR, th.botG, th.botB);
 
-    rectGradV(L_BG, 0, 0, SCREEN_W, SCREEN_H / 2, 20, 6, 44, 6, 8, 38);
-    rectGradV(L_BG, 0, SCREEN_H / 2, SCREEN_W, SCREEN_H / 2, 6, 8, 38, 2, 4, 20);
+    /* --- [FASE 3] lapisan awan/debu parallax: 2 lapis, kecepatan berbeda, di antara nebula & bintang --- */
+    for (int i = 0; i < 4; i++) {                     /* lapis jauh: lambat, besar, redup */
+        int cy = ((frame / 3) + i * 70) % (SCREEN_H + 60) - 30;
+        int cx = 30 + i * 85 + sinS(frame / 20 + i * 5) / 12;
+        discLo(L_PLANET, cx, cy, 28, th.cloudR / 3, th.cloudG / 3, th.cloudB / 3, 0, 0, 0);
+    }
+    for (int i = 0; i < 3; i++) {                     /* lapis dekat: lebih cepat, kecil, lebih terang */
+        int cy = ((frame * 2 / 3) + i * 90 + 40) % (SCREEN_H + 40) - 20;
+        int cx = 60 + i * 100 + sinS(frame / 9 + i * 9) / 8;
+        discLo(L_PLANET, cx, cy, 14, th.cloudR / 2, th.cloudG / 2, th.cloudB / 2, 0, 0, 0);
+    }
+
+    rectGradV(L_BG, 0, 0, SCREEN_W, SCREEN_H / 2,  th.topR, th.topG, th.topB,  th.botR * 3, th.botG * 3, th.botB * 2);
+    rectGradV(L_BG, 0, SCREEN_H / 2, SCREEN_W, SCREEN_H / 2,  th.botR * 3, th.botG * 3, th.botB * 2,  th.botR, th.botG, th.botB);
 }
 
 /* ---------- Skin system ---------- */
@@ -1010,6 +1207,7 @@ static void spawnNovaBurst(int x, int y) {
         novabursts[i].x = x; novabursts[i].y = y;
         novabursts[i].phase = 0; novabursts[i].timer = NOVA_WARN;
         novabursts[i].alive = 1;
+        sfxPlay(SND_WARN);
         return;
     }
 }
@@ -1089,6 +1287,8 @@ static void spawnSparks(int x, int y, int n, int r, int g, int b, int big) {
 }
 
 static void spawnExplosion(int x, int y, int big) {
+    sfxPlay(big ? SND_EXPLODE_B : SND_EXPLODE_S);
+    if (big) fxShake(3);
     for (int i = 0; i < MAX_EXPLOSIONS; i++) {
         if (!explosions[i].alive) {
             explosions[i].x = x;
@@ -1356,6 +1556,9 @@ static void hurtPlayer(int p) {
     Player *pl = &players[p];
     spawnExplosion(pl->x + 8, pl->y + 8, 0);
     pl->lives--;
+    sfxPlay(SND_HURT);
+    fxShake(5);
+    fxFlash(4);
     pl->invuln = 90;
     if (pl->lives <= 0) {
         pl->alive = 0;
@@ -1442,6 +1645,7 @@ static void spawnMLaser(int x, int y, int angle) {
         mlasers[i].angle = angle;
         mlasers[i].timer = MLASER_WARN + MLASER_FIRE;
         mlasers[i].alive = 1;
+        sfxPlay(SND_LASER);
         return;
     }
 }
@@ -1524,6 +1728,9 @@ int main(void) {
     InitPAD(padbuf[0], 34, padbuf[1], 34);
     StartPAD();
     ChangeClearPAD(0);
+    audioInit();
+    musicPlay(SONG_MENU);
+    fxFadeInNow();
 
     for (int p = 0; p < MAX_PLAYERS; p++) {
         players[p].active = 0;
@@ -1541,8 +1748,34 @@ int main(void) {
         for (int p = 0; p < MAX_PLAYERS; p++)
             connected[p] = readPad(p, &btn[p]);
 
+        {
+            int newState = state;
+            if (fxUpdate(&newState)) {
+                /* layar gelap penuh: aman melakukan reset & ganti state tanpa terlihat */
+                if (newState == STATE_PLAY) {
+                    clearWorld();
+                    nextBossScore = 30;
+                    bossOn = 0;
+                    madSpawned = 0;
+                    frame = 0;
+                    musicPlay(SONG_PLAY);
+                } else if (newState == STATE_MENU) {
+                    for (int q = 0; q < MAX_PLAYERS; q++) { players[q].active = 0; players[q].alive = 0; }
+                    musicPlay(SONG_MENU);
+                }
+                state = newState;
+            }
+        }
+        int fading = (fadeDir != 0);   /* selama fade: abaikan input pindah-state */
+
         int level = 1 + totalScore() / 10;
         if (level > 10) level = 10;
+        /* Tema hanya mengikuti level saat STATE_PLAY. Di GAMEOVER tema DIBEKUKAN (tidak berubah).
+           Di menu/gacha/skin tema selalu tema 1. Kembali ke tema 1 terjadi instan di balik layar
+           gelap saat fade (lihat blok fxUpdate) sehingga tidak terlihat. */
+        if (state == STATE_PLAY)                 themeSetLevel(level, frame < 2);
+        else if (state != STATE_GAMEOVER)        themeSetLevel(1, 1);
+        themeUpdate();
 
         for (int i = 0; i < NUM_STARS; i++) {
             stars[i].y += stars[i].speed;
@@ -1593,16 +1826,12 @@ int main(void) {
                 }
             }
 
-            if (countActive() > 0 && connected[0] && pressedP(0, btn[0], PAD_CROSS) && konami == 0) {
-                clearWorld();
-                nextBossScore = 30;
-                bossOn = 0;
-                madSpawned = 0;
-                frame = 0;
-                state = STATE_PLAY;
+            if (!fading && countActive() > 0 && connected[0] && pressedP(0, btn[0], PAD_CROSS) && konami == 0) {
+                sfxPlay(SND_MENU_SEL);
+                fxFadeTo(STATE_PLAY);
             }
-            if (connected[0] && pressedP(0, btn[0], PAD_SELECT)) state = STATE_GACHA;
-            if (connected[0] && pressedP(0, btn[0], PAD_SQUARE)) state = STATE_SKINSELECT;
+            if (!fading && connected[0] && pressedP(0, btn[0], PAD_SELECT)) fxFadeTo(STATE_GACHA);
+            if (!fading && connected[0] && pressedP(0, btn[0], PAD_SQUARE)) fxFadeTo(STATE_SKINSELECT);
         } else if (state == STATE_PLAY) {
             for (int p = 0; p < MAX_PLAYERS; p++) {
                 if (!connected[p] || players[p].active) continue;
@@ -1647,6 +1876,7 @@ int main(void) {
                     cd -= pl->speedStack * 2;
                     if (cd < 1) cd = 1;
                     pl->cooldown = cd;
+                    sfxPlay(SND_SHOOT);
                 }
             }
 
@@ -1694,6 +1924,13 @@ int main(void) {
                 for (int i = 0; i < MAX_ENEMIES; i++)
                     if (enemies[i].alive && enemies[i].type == E_BOSS) bossAlive = 1;
                 bossOn = bossAlive;
+            }
+            {
+                int wantSong = (bossOn || mad.alive) ? SONG_BOSS : SONG_PLAY;
+                if (musicCurrent() != wantSong) {
+                    musicPlay(wantSong);
+                    if (wantSong == SONG_BOSS) sfxPlay(SND_BOSS);
+                }
             }
             if (!bossOn && !mad.alive && totalScore() >= nextBossScore) {
                 for (int i = 0; i < MAX_ENEMIES; i++) {
@@ -1922,6 +2159,7 @@ int main(void) {
                        salah dianggap "menyerap peluru tanpa rusak" oleh cek generic di bawah ini. */
                     if (e->type != E_PHANTOM && e->type != E_CHARGER && e->type != E_MIRROR && e->shield > 0) {
                         e->shield--;
+                        sfxPlay(SND_HIT);
                         spawnSparks(bullets[j].x + 2, bullets[j].y, 4, 100, 200, 255, 0);
                         continue;
                     }
@@ -2013,7 +2251,7 @@ int main(void) {
             /* ---------- [MAD] logika boss rahasia ---------- */
             if (mad.alive) {
                 if (mad.hit > 0) mad.hit--;
-                if (!mad.phase2 && mad.hp * 2 <= mad.maxhp && mad.state != MAD_DYING) mad.phase2 = 1;
+                if (!mad.phase2 && mad.hp * 2 <= mad.maxhp && mad.state != MAD_DYING) { mad.phase2 = 1; fxShake(SHAKE_MAX); fxFlash(8); sfxPlay(SND_BOSS); }
 
                 if (mad.state == MAD_DYING) {
                     mad.dyingT++;
@@ -2081,6 +2319,7 @@ int main(void) {
                     spawnSparks(bullets[j].x + 2, bullets[j].y, 3, 120, 255, 160, 0);
                     if (mad.hp <= 0 && mad.state != MAD_DYING) {
                         mad.state = MAD_DYING; mad.dyingT = 0;
+                        fxShake(SHAKE_MAX); fxFlash(14);
                         for (int i = 0; i < MAX_MISSILES; i++) missiles[i].alive = 0;
                         for (int i = 0; i < MAX_BOMBS; i++)    mbombs[i].alive = 0;
                         for (int i = 0; i < MAX_MLASERS; i++)  mlasers[i].alive = 0;
@@ -2232,6 +2471,7 @@ int main(void) {
                     if (!pl->active || !pl->alive) continue;
                     if (overlap(pl->x, pl->y, PLAYER_W, PLAYER_H, items[i].x, items[i].y, 10, 10)) {
                         applyItem(pl, items[i].type);
+                        sfxPlay(SND_ITEM);
                         spawnSparks(items[i].x + 5, items[i].y + 5, 5, 200, 255, 200, 0);
                         items[i].alive = 0;
                         break;
@@ -2241,30 +2481,28 @@ int main(void) {
 
             if (countAlive() == 0) {
                 awardGems(totalScore());
+                fxFlash(10);
+                fxShake(SHAKE_MAX);
                 state = STATE_GAMEOVER;
             }
         } else if (state == STATE_GACHA) {
             if (gachaFlashT > 0) gachaFlashT--;
             if (connected[0] && pressedP(0, btn[0], PAD_CROSS) && gachaFlashT == 0) {
-                if (doGachaPull()) gachaFlashT = 20;
+                if (doGachaPull()) { gachaFlashT = 20; sfxPlay(SND_POWERUP); }
             }
-            if (connected[0] && pressedP(0, btn[0], PAD_CIRCLE)) state = STATE_MENU;
+            if (!fading && connected[0] && pressedP(0, btn[0], PAD_CIRCLE)) fxFadeTo(STATE_MENU);
         } else if (state == STATE_SKINSELECT) {
             if (connected[0]) {
-                if (pressedP(0, btn[0], PAD_LEFT))  skinCursor = (skinCursor + NUM_SKINS - 1) % NUM_SKINS;
+                if (pressedP(0, btn[0], PAD_LEFT))  { skinCursor = (skinCursor + NUM_SKINS - 1) % NUM_SKINS; sfxPlay(SND_MENU_MOVE); }
                 if (pressedP(0, btn[0], PAD_RIGHT)) skinCursor = (skinCursor + 1) % NUM_SKINS;
                 if (pressedP(0, btn[0], PAD_CROSS) && (unlockedMask & (1u << skinCursor)))
                     players[0].skin = skinCursor;
-                if (pressedP(0, btn[0], PAD_CIRCLE)) state = STATE_MENU;
+                if (!fading && pressedP(0, btn[0], PAD_CIRCLE)) fxFadeTo(STATE_MENU);
             }
         } else {
             for (int p = 0; p < MAX_PLAYERS; p++) {
-                if (connected[p] && pressedP(p, btn[p], PAD_START)) {
-                    for (int q = 0; q < MAX_PLAYERS; q++) {
-                        players[q].active = 0;
-                        players[q].alive = 0;
-                    }
-                    state = STATE_MENU;
+                if (!fading && connected[p] && pressedP(p, btn[p], PAD_START)) {
+                    fxFadeTo(STATE_MENU);
                     break;
                 }
             }
@@ -2273,7 +2511,7 @@ int main(void) {
         /* ---------- Gambar ---------- */
 
         drawBackground(frame);
-        drawStars(frame);
+        drawStars(frame, (state == STATE_PLAY && (mad.alive || bossOn)) ? 2 : 0);
         drawShootingStar();
 
         if (state == STATE_MENU) {
@@ -2401,7 +2639,10 @@ int main(void) {
         }
         FntFlush(-1);
 
+        audioUpdate();
         setBlendMode(L_GLOW, 1);
+        fxDraw();
+        fxApplyShake(frame);
         flip();
         for (int p = 0; p < MAX_PLAYERS; p++) prevBtn[p] = btn[p];
         frame++;

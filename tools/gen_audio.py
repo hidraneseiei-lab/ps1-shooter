@@ -239,19 +239,26 @@ def _loop_cycles(wave_fn, cycles):
     dur = cycles / BASE_FREQ
     return wave_fn(BASE_FREQ, dur)
 
-def inst_lead():      # square duty 25%, terang - lead chiptune
-    return norm(_loop_cycles(lambda f, d: square(f, d, 0.25), 16), 0.8)
+def _soften(x, cutoff=0.55):
+    """Low-pass ringan: melembutkan tepi tajam gelombang kotak/gergaji supaya tidak
+    terdengar seperti buzzer 'net-net-net' saat dimainkan staccato cepat.
+    cutoff mendekati 1.0 = nyaris tidak difilter; makin kecil = makin lembut/redup."""
+    return lowpass(x, cutoff)
 
-def inst_pad():       # square duty 50% + sedikit saw - pad synthwave
+def inst_lead():      # square duty 28%, dilembutkan cukup kuat (~600Hz cutoff) - tetap jadi lead
+    #                       yang jelas tapi tepinya landai, tidak lagi berbunyi buzzer tajam
+    return norm(_soften(_loop_cycles(lambda f, d: square(f, d, 0.28), 16), 0.16), 0.8)
+
+def inst_pad():       # square duty 50% + sedikit saw - pad synthwave, PALING lembut (latar, bukan fokus)
     a = _loop_cycles(lambda f, d: square(f, d, 0.5), 16)
     b = _loop_cycles(saw, 16)
-    return norm(a * 0.5 + b * 0.5, 0.75)
+    return norm(_soften(a * 0.5 + b * 0.5, 0.10), 0.75)
 
 def inst_bass():      # segitiga tebal - bass
     return norm(_loop_cycles(tri_w, 16), 0.85)
 
-def inst_saw():       # saw untuk arpeggio boss
-    return norm(_loop_cycles(saw, 16), 0.8)
+def inst_saw():       # saw untuk arpeggio, dilembutkan sedang (tetap ada "gigi" tapi tidak menusuk)
+    return norm(_soften(_loop_cycles(saw, 16), 0.22), 0.8)
 
 def drum_kick():
     dur = 0.22

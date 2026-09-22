@@ -1,3 +1,4 @@
+/* ps1-shooter - dibuat oleh hidraneseiei21 */
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -147,6 +148,9 @@ static NovaBurst novabursts[MAX_NOVABURST];
 static Mine      mines[MAX_MINES];   /* [BARU] */
 
 static int shootX = -100, shootY = 0, shootT = 0;
+
+/* [POLISH] jendela teks berposisi tetap (ID dari FntOpen). Tidak lagi bergantung hitungan \n. */
+static int fntTop = -1, fntMid = -1, fntBot = -1;
 
 static const int playerColor[MAX_PLAYERS][3] = {
     {  80, 160, 255 },
@@ -510,23 +514,39 @@ static void roundedPanel(int layer, int x, int y, int w, int h, int rad,
 
 /* ---------- Planet ---------- */
 
+/* [POLISH] Planet: sisi gelap tetap berwarna (tidak hitam), tepi memberi cincin atmosfer,
+   dan ada pita permukaan supaya tampak seperti planet gas, bukan segi-8 hitam polos. */
 static void planetSphere(int cx, int cy, int rad,
                          int litR, int litG, int litB,
                          int darkR, int darkG, int darkB) {
+    /* lantai warna sisi gelap: minimal 35% warna terang agar tidak pernah jadi lubang hitam */
+    int fR = litR * 35 / 100, fG = litG * 35 / 100, fB = litB * 35 / 100;
+    if (darkR < fR) darkR = fR;
+    if (darkG < fG) darkG = fG;
+    if (darkB < fB) darkB = fB;
     for (int i = 0; i < 16; i++) {
         int x1 = cx + cosI(i)     * rad / 127;
         int y1 = cy + sinI(i)     * rad / 127;
         int x2 = cx + cosI(i + 1) * rad / 127;
         int y2 = cy + sinI(i + 1) * rad / 127;
-        int litAmt = cosI(i) + 127;
+        int litAmt = (-cosI(i) + 127);                 /* sisi terang menghadap kiri-atas (matahari) */
+        litAmt = (litAmt + (-sinI(i) + 127)) / 2;
         int r = darkR + (litR - darkR) * litAmt / 254;
         int g = darkG + (litG - darkG) * litAmt / 254;
         int b = darkB + (litB - darkB) * litAmt / 254;
         tri(L_PLANET, cx, cy, r, g, b,
-                      x1, y1, r / 3, g / 3, b / 3,
-                      x2, y2, r / 3, g / 3, b / 3);
+                      x1, y1, r * 2 / 3, g * 2 / 3, b * 2 / 3,
+                      x2, y2, r * 2 / 3, g * 2 / 3, b * 2 / 3);
     }
-    glowDisc(cx - rad / 4, cy - rad / 4, rad + 6, litR, litG, litB, 8);
+    /* pita permukaan (2 garis miring lembut) */
+    for (int k = -1; k <= 1; k += 2) {
+        int yy = cy + k * rad / 3;
+        int hw = rad * 8 / 10;
+        rect(L_PLANET, cx - hw, yy, hw * 2, 1, litR * 6 / 10, litG * 6 / 10, litB * 6 / 10);
+    }
+    /* atmosfer: kilau additive di tepi + sorot matahari */
+    glowDisc(cx, cy, rad + 5, litR / 2, litG / 2, litB / 2, 8);
+    glowDisc(cx - rad / 3, cy - rad / 3, rad / 2 + 4, litR, litG, litB, 8);
 }
 
 /* ---------- Starfield ---------- */
@@ -670,16 +690,16 @@ static void drawBackground(int frame) {
     disc(L_BG, 260, 160, 70, th.neb2R, th.neb2G + pulse, th.neb2B + pulse,  th.botR, th.botG, th.botB);
     disc(L_BG, 230, 180, 50, th.neb2R + 4, th.neb2G + pulse + 10, th.neb2B + pulse + 5,  th.botR, th.botG, th.botB);
 
-    /* --- [FASE 3] lapisan awan/debu parallax: 2 lapis, kecepatan berbeda, di antara nebula & bintang --- */
-    for (int i = 0; i < 4; i++) {                     /* lapis jauh: lambat, besar, redup */
-        int cy = ((frame / 3) + i * 70) % (SCREEN_H + 60) - 30;
-        int cx = 30 + i * 85 + sinS(frame / 20 + i * 5) / 12;
-        discLo(L_PLANET, cx, cy, 28, th.cloudR / 3, th.cloudG / 3, th.cloudB / 3, 0, 0, 0);
-    }
-    for (int i = 0; i < 3; i++) {                     /* lapis dekat: lebih cepat, kecil, lebih terang */
-        int cy = ((frame * 2 / 3) + i * 90 + 40) % (SCREEN_H + 40) - 20;
-        int cx = 60 + i * 100 + sinS(frame / 9 + i * 9) / 8;
-        discLo(L_PLANET, cx, cy, 14, th.cloudR / 2, th.cloudG / 2, th.cloudB / 2, 0, 0, 0);
+    /* --- [POLISH] debu kosmik: garis-garis kecil jatuh bertingkat kecepatan (efek melaju).
+       Sebelumnya berupa cakram gelap besar yang tampak seperti "lubang hitam". Sekarang
+       hanya TILE tipis berwarna tema, jadi tidak pernah menutupi musuh/peluru. --- */
+    for (int i = 0; i < 10; i++) {
+        int sp = 2 + (i % 3) * 2;                          /* 2,4,6 px/frame */
+        int cy = (frame * sp + i * 37) % (SCREEN_H + 24) - 12;
+        int cx = (i * 61 + 13) % SCREEN_W;
+        int len = 4 + sp * 2;
+        int a  = 50 + sp * 14;
+        rect(L_PLANET, cx, cy, 1, len, th.cloudR * a / 255, th.cloudG * a / 255, th.cloudB * a / 255);
     }
 
     rectGradV(L_BG, 0, 0, SCREEN_W, SCREEN_H / 2,  th.topR, th.topG, th.topB,  th.botR * 3, th.botG * 3, th.botB * 2);
@@ -853,35 +873,82 @@ static void drawShieldAura(const Player *pl, int frame) {
 
 /* ---------- Pesawat pemain ---------- */
 
+/* [POLISH] Desain pesawat baru "STARFURY".
+   Kotak hitbox tetap 16x16 (x..x+16, y..y+16) supaya gameplay tidak berubah;
+   sayap dan api boleh menjorok keluar secara visual.
+     - hidung runcing panjang dengan pantulan cahaya
+     - badan dua-tone (terang di tengah, gelap di tepi) memberi kesan volume
+     - sayap sapu ke belakang, ujungnya lancip, ada strip warna skin
+     - dua sirip kecil di belakang
+     - kokpit kaca bercahaya biru-putih
+     - dua mesin dengan api tiga lapis yang berdenyut
+*/
 static void drawPlayer(int x, int y, int frame, int skin) {
     const SkinDef *s = &skinTable[skin];
     int cx = x + 8;
-    int fl = 4 + (frame / 2) % 4;
+    int flick = (frame / 2) % 3;             /* 0..2 : denyut api */
+    int fl = 5 + flick * 2;                  /* panjang api */
 
-    glowDisc(cx - 4, y + 18, 4 + fl / 2, s->glowR, s->glowG, s->glowB, 8);
-    glowDisc(cx + 4, y + 18, 4 + fl / 2, s->glowR, s->glowG, s->glowB, 8);
-    tri(L_PLAYER, cx - 5, y + 16, 255, 255, 220,  cx - 2, y + 16, 255, 255, 220,
-                  cx - 4, y + 16 + fl, s->glowR, s->glowG / 3, 0);
-    tri(L_PLAYER, cx + 2, y + 16, 255, 255, 220,  cx + 5, y + 16, 255, 255, 220,
-                  cx + 4, y + 16 + fl, s->glowR, s->glowG / 3, 0);
+    /* --- api mesin (di belakang badan) --- */
+    for (int side = -1; side <= 1; side += 2) {
+        int ex = cx + side * 4;
+        glowDisc(ex, y + 20, 5 + flick, s->glowR, s->glowG, s->glowB, 8);
+        tri(L_PLAYER, ex - 2, y + 17, 255, 255, 255,
+                      ex + 2, y + 17, 255, 255, 255,
+                      ex,     y + 17 + fl + 3, 255, 200, 60);
+        tri(L_PLAYER, ex - 3, y + 17, s->glowR, s->glowG, s->glowB,
+                      ex + 3, y + 17, s->glowR, s->glowG, s->glowB,
+                      ex,     y + 17 + fl + 6, s->glowR / 2, 20, 0);
+    }
 
-    tri(L_PLAYER, cx - 3, y + 4,  clamp255(s->wingR+50), clamp255(s->wingG+50), 255,
-                  x - 8,  y + 18, s->wingR, s->wingG, s->wingB,
-                  cx - 3, y + 15, clamp255(s->wingR+20), clamp255(s->wingG+20), clamp255(s->wingB+20));
-    tri(L_PLAYER, cx + 3, y + 4,  clamp255(s->wingR+50), clamp255(s->wingG+50), 255,
-                  x + 24, y + 18, s->wingR, s->wingG, s->wingB,
-                  cx + 3, y + 15, clamp255(s->wingR+20), clamp255(s->wingG+20), clamp255(s->wingB+20));
-    rect(L_PLAYER, x - 8,  y + 16, 3, 3, 255, 240, 80);
-    rect(L_PLAYER, x + 21, y + 16, 3, 3, 255, 240, 80);
+    /* --- sirip ekor kecil --- */
+    tri(L_PLAYER, cx - 5, y + 10, s->wingR, s->wingG, s->wingB,
+                  cx - 7, y + 20, s->hullR / 2, s->hullG / 2, s->hullB / 2,
+                  cx - 3, y + 16, s->wingR / 2, s->wingG / 2, s->wingB / 2);
+    tri(L_PLAYER, cx + 5, y + 10, s->wingR, s->wingG, s->wingB,
+                  cx + 7, y + 20, s->hullR / 2, s->hullG / 2, s->hullB / 2,
+                  cx + 3, y + 16, s->wingR / 2, s->wingG / 2, s->wingB / 2);
 
-    tri(L_PLAYER, cx, y - 4, 255, 255, 255,
-                  cx - 6, y + 16, s->hullR, s->hullG, s->hullB,
-                  cx + 6, y + 16, s->hullR, s->hullG, s->hullB);
-    rect(L_PLAYER, cx - 1, y + 6, 3, 8, 255, 150, 30);
+    /* --- sayap sapu --- */
+    for (int side = -1; side <= 1; side += 2) {
+        int rx = cx + side * 4;            /* pangkal sayap di badan */
+        int tx = cx + side * 17;           /* ujung sayap (menjorok keluar) */
+        /* panel atas sayap: terang di pangkal, gelap di ujung */
+        tri(L_PLAYER, rx, y + 3,
+                      clamp255(s->wingR + 70), clamp255(s->wingG + 70), clamp255(s->wingB + 70),
+                      tx, y + 19, s->wingR / 2, s->wingG / 2, s->wingB / 2,
+                      rx, y + 15, s->wingR, s->wingG, s->wingB);
+        /* strip warna aksen di tepi depan sayap */
+        tri(L_PLAYER, rx, y + 3,  255, 255, 255,
+                      tx, y + 19, s->glowR, s->glowG, s->glowB,
+                      rx + side * 2, y + 9, s->glowR, s->glowG, s->glowB);
+        /* lampu ujung sayap */
+        rect(L_PLAYER, tx - 1, y + 17, 3, 3, 255, 250, 200);
+    }
 
-    tri(L_PLAYER, cx, y + 1, 220, 255, 255,
-                  cx - 3, y + 9, 40, 160, 230,
-                  cx + 3, y + 9, 40, 160, 230);
+    /* --- badan utama: dua sisi berbeda kecerahan -> kesan volume --- */
+    tri(L_PLAYER, cx, y - 8, 255, 255, 255,               /* hidung */
+                  cx - 6, y + 17,
+                  s->hullR * 6 / 10, s->hullG * 6 / 10, s->hullB * 6 / 10,
+                  cx,     y + 17, s->hullR, s->hullG, s->hullB);
+    tri(L_PLAYER, cx, y - 8, 255, 255, 255,
+                  cx,     y + 17, s->hullR, s->hullG, s->hullB,
+                  cx + 6, y + 17,
+                  clamp255(s->hullR + 40), clamp255(s->hullG + 40), clamp255(s->hullB + 40));
+    /* panel jahitan badan (di bawah kokpit, tidak menimpanya) */
+    rect(L_PLAYER, cx - 1, y + 11, 2, 5, 30, 30, 50);
+    rect(L_PLAYER, cx - 4, y + 14, 8, 1, 20, 20, 40);
+
+    /* --- kokpit kaca (digambar TERAKHIR di atas badan, lebih besar & jelas) --- */
+    tri(L_PLAYER, cx, y - 5, 240, 255, 255,
+                  cx - 3, y + 7, 40, 150, 230,
+                  cx + 3, y + 7, 20, 90, 200);
+    tri(L_PLAYER, cx, y - 5, 255, 255, 255,
+                  cx - 1, y + 1, 210, 245, 255,
+                  cx + 1, y + 1, 210, 245, 255);        /* pantulan */
+
+    /* --- moncong meriam kecil di hidung --- */
+    rect(L_PLAYER, cx - 1, y - 9, 2, 3, 255, 255, 255);
 }
 
 static void drawPlayerTag(int p, int x, int y) {
@@ -1387,44 +1454,75 @@ static void drawHUD(int level) {
     setBlendMode(L_HUD_BASE, 0);
 }
 
+/* [POLISH] Panel UI: bayangan lembut + isi gelap semi-transparan + garis tepi neon.
+   Tidak lagi menumpuk dua panel bertransparansi (penyebab abu-abu keruh sebelumnya). */
+static void uiPanel(int x, int y, int w, int h, int r, int g, int b) {
+    /* isi: gelap, semi-transparan (mode 0 = 50% belakang + 50% depan) */
+    roundedPanel(L_HUD_BASE, x, y, w, h, 10, r / 4, g / 4, b / 4, 1);
+    setBlendMode(L_HUD_BASE, 0);
+    /* garis tepi neon (opaque) di 4 sisi */
+    rect(L_HUD_TOP, x + 10,     y,         w - 20, 1, r, g, b);
+    rect(L_HUD_TOP, x + 10,     y + h - 1, w - 20, 1, r, g, b);
+    rect(L_HUD_TOP, x,          y + 10,    1, h - 20, r, g, b);
+    rect(L_HUD_TOP, x + w - 1,  y + 10,    1, h - 20, r, g, b);
+}
+
 static void drawMenu(int frame, int nPlayers) {
-    roundedPanel(L_HUD_BASE, 40, 52, 240, 44, 12, 255, 150, 40, 0);
-    roundedPanel(L_HUD_TOP, 40, 52, 240, 44, 12, 255, 255, 255, 1);
-    setBlendMode(L_HUD_TOP, 0);
-    glowDisc(160, 74, 90, 255, 180, 60, 8);
+    /* judul: pita gradien + kilau, bukan kotak jingga kosong */
     int bob = sinS(frame / 2) / 20;
+    glowDisc(160, 66, 70, 255, 150, 50, 8);
+    rectGradV(L_HUD_BASE, 30, 44, 260, 44, 40, 20, 90, 12, 8, 40);
+    rect(L_HUD_TOP, 30, 44, 260, 1, 120, 200, 255);
+    rect(L_HUD_TOP, 30, 87, 260, 1, 255, 150, 50);
+    /* garis kecepatan dekoratif di kiri-kanan judul */
+    for (int i = 0; i < 4; i++) {
+        int len = 18 + ((frame / 2 + i * 7) % 24);
+        rect(L_HUD_TOP, 30 - len, 52 + i * 9, len, 1, 80, 160, 255);
+        rect(L_HUD_TOP, 290,      52 + i * 9, len, 1, 80, 160, 255);
+    }
     int n = nPlayers < 1 ? 1 : nPlayers;
     for (int p = 0; p < n; p++) {
         int x = SCREEN_W / 2 - 8 + (p * 44 - (n - 1) * 22);
-        drawPlayer(x, 140 + bob, frame, players[p].skin);
+        drawPlayer(x, 128 + bob, frame, players[p].skin);
     }
+    /* panel petunjuk di bawah */
+    uiPanel(20, 186, 280, 44, 80, 160, 255);
 }
 
 static void drawGachaScreen(int frame) {
-    roundedPanel(L_HUD_BASE, 30, 40, 260, 160, 14, 20, 15, 45, 0);
-    roundedPanel(L_HUD_TOP,  30, 40, 260, 160, 14, 255, 255, 255, 1);
-    setBlendMode(L_HUD_TOP, 0);
+    uiPanel(30, 40, 260, 160, 200, 150, 255);
     if (gachaFlashT > 0) {
-        glowDisc(160, 110, 30 + (20 - gachaFlashT), skinTable[gachaResultSkin].glowR,
+        glowDisc(160, 106, 30 + (20 - gachaFlashT), skinTable[gachaResultSkin].glowR,
                  skinTable[gachaResultSkin].glowG, skinTable[gachaResultSkin].glowB, 8);
-        drawPlayer(152, 95, frame, gachaResultSkin);
+        drawPlayer(152, 92, frame, gachaResultSkin);
     } else {
-        glowDisc(160, 110, 26 + sinS(frame) / 16, 200, 180, 255, 8);
+        /* kapsul gacha berdenyut */
+        int pl = 26 + sinS(frame) / 16;
+        glowDisc(160, 106, pl, 200, 150, 255, 8);
+        disc(L_HUD_TOP, 160, 106, 14, 255, 240, 255, 150, 90, 220);
+        rect(L_HUD_TOP, 146, 105, 28, 2, 255, 255, 255);
     }
 }
 
 static void drawSkinSelectScreen(int frame) {
-    roundedPanel(L_HUD_BASE, 10, 40, 300, 170, 14, 15, 20, 45, 0);
-    roundedPanel(L_HUD_TOP,  10, 40, 300, 170, 14, 255, 255, 255, 1);
-    setBlendMode(L_HUD_TOP, 0);
+    uiPanel(8, 36, 304, 178, 120, 200, 255);
     for (int i = 0; i < NUM_SKINS; i++) {
         int col = i % 3, row = i / 3;
-        int x = 65 + col * 95, y = 75 + row * 75;
-        if (unlockedMask & (1u << i)) drawPlayer(x - 8, y, frame, i);
-        else                          disc(L_PLAYER, x, y + 8, 10, 40, 40, 50, 20, 20, 25);
-        if (i == skinCursor) {
-            rect(L_HUD_TOP, x - 22, y - 8,  44, 2, 255, 255, 255);
-            rect(L_HUD_TOP, x - 22, y + 32, 44, 2, 255, 255, 255);
+        int x = 55 + col * 105, y = 70 + row * 62;
+        int sel = (i == skinCursor);
+        /* kotak slot */
+        rect(L_HUD_BASE, x - 32, y - 10, 64, 52, sel ? 60 : 20, sel ? 80 : 26, sel ? 130 : 46);
+        if (sel) {
+            rect(L_HUD_TOP, x - 32, y - 10, 64, 1, 255, 255, 255);
+            rect(L_HUD_TOP, x - 32, y + 41, 64, 1, 255, 255, 255);
+            rect(L_HUD_TOP, x - 32, y - 10, 1, 52, 255, 255, 255);
+            rect(L_HUD_TOP, x + 31, y - 10, 1, 52, 255, 255, 255);
+        }
+        /* pesawat digambar di L_PLAYER (bukan di bawah panel) berkat panel sekarang ada di HUD_BASE */
+        if (unlockedMask & (1u << i)) drawPlayer(x - 8, y + 4, frame, i);
+        else {
+            disc(L_HUD_TOP, x, y + 14, 10, 50, 50, 64, 24, 24, 34);
+            rect(L_HUD_TOP, x - 3, y + 12, 6, 6, 120, 120, 140);   /* gembok */
         }
     }
 }
@@ -1723,7 +1821,9 @@ int main(void) {
     initStars();
 
     FntLoad(960, 0);
-    FntOpen(8, TEXT_Y, SCREEN_W - 16, 200, 0, 512);
+    fntTop = FntOpen(8,   8, SCREEN_W - 16,  24, 0, 96);
+    fntMid = FntOpen(24, 96, SCREEN_W - 48, 100, 0, 320);
+    fntBot = FntOpen(28, 192, SCREEN_W - 56,  40, 0, 240);
 
     InitPAD(padbuf[0], 34, padbuf[1], 34);
     StartPAD();
@@ -2604,40 +2704,36 @@ int main(void) {
             if (state == STATE_PLAY) drawActiveBuffs();
         }
 
-        /* ---------- Teks ---------- */
+        /* ---------- Teks (jendela berposisi tetap) ---------- */
         if (state == STATE_MENU) {
             int n = countActive();
-            char line[3][40];
-            int lineUsed = 0;
-            for (int p = 1; p < MAX_PLAYERS && lineUsed < 3; p++) {
-                if (connected[p] && !players[p].active) {
-                    snprintf(line[lineUsed], sizeof(line[0]), "   %dP PRESS START TO JOIN", p + 1);
-                    lineUsed++;
-                }
-            }
-            FntPrint(-1, "\n\n\n   SPACE SHOOTER\n\n\n\n\n\n\n\n\n\n\n\n\n");
-            if (n == 0) FntPrint(-1, "   1P PRESS START TO JOIN\n");
-            else        FntPrint(-1, "   %d PLAYER%s  X = MULAI\n", n, n > 1 ? "S" : "");
-            for (int i = 0; i < lineUsed; i++) FntPrint(-1, "%s\n", line[i]);
-            FntPrint(-1, "   SELECT=GACHA  SQUARE=SKIN   GEMS %d", gems);
+            FntPrint(fntTop, "SPACE SHOOTER\nby hidraneseiei21");
+            FntPrint(fntMid, "");
+            if (n == 0) FntPrint(fntBot, "1P PRESS START TO JOIN\n");
+            else        FntPrint(fntBot, "%d PLAYER%s  X=MULAI\n", n, n > 1 ? "S" : "");
+            for (int p = 1; p < MAX_PLAYERS; p++)
+                if (connected[p] && !players[p].active) { FntPrint(fntBot, "%dP: START=JOIN  ", p + 1); }
+            FntPrint(fntBot, "\nSEL=GACHA SQR=SKIN GEMS %d", gems);
         } else if (state == STATE_PLAY) {
-            FntPrint(-1, "TOTAL %d  GEMS %d", totalScore(), gems);
+            FntPrint(fntTop, "TOTAL %d   GEMS %d", totalScore(), gems);
         } else if (state == STATE_GACHA) {
-            if (gachaFlashT > 0) {
-                FntPrint(-1, "\n\n\n\n\n\n\n\n\n\n\n\n      %s%s",
-                         skinTable[gachaResultSkin].name,
-                         gachaResultDup ? " (DUPLICATE +15 GEMS)" : " UNLOCKED!");
-            } else {
-                FntPrint(-1, "GEMS %d\n\n\n\n\n\n\n\n\n\n\n    X = PULL (%d GEMS)\n    O = KEMBALI", gems, GACHA_COST);
-            }
+            FntPrint(fntTop, "GACHA   GEMS %d", gems);
+            if (gachaFlashT > 0)
+                FntPrint(fntMid, "\n\n\n\n\n%s%s", skinTable[gachaResultSkin].name,
+                         gachaResultDup ? " (DUP +15)" : " UNLOCKED!");
+            FntPrint(fntBot, "X=PULL (%d)  O=KEMBALI", GACHA_COST);
         } else if (state == STATE_SKINSELECT) {
-            FntPrint(-1, "PILIH SKIN (P1)\n\n\n\n\n\n\n\n\n\n\n\n    %s%s\n    O = KEMBALI",
-                     skinTable[skinCursor].name,
+            FntPrint(fntTop, "PILIH SKIN (P1)");
+            FntPrint(fntBot, "%s%s\nX=PILIH O=KEMBALI", skinTable[skinCursor].name,
                      (unlockedMask & (1u << skinCursor)) ? "" : " (TERKUNCI)");
         } else {
-            FntPrint(-1, "TOTAL %d\n\n\n\n\n\n\n    GAME OVER\n\n    FINAL %d\n\n\n    PRESS START", totalScore(), totalScore());
+            FntPrint(fntTop, "TOTAL %d", totalScore());
+            FntPrint(fntMid, "      GAME OVER\n\n      FINAL SCORE %d\n\n      GEMS +%d\n\n      hidraneseiei21", totalScore(), totalScore() / 2 + 5);
+            FntPrint(fntBot, "    PRESS START");
         }
-        FntFlush(-1);
+        FntFlush(fntTop);
+        FntFlush(fntMid);
+        FntFlush(fntBot);
 
         audioUpdate();
         setBlendMode(L_GLOW, 1);

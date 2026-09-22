@@ -1,5 +1,6 @@
 /*
- * audio.c - driver SPU langsung (memory-mapped register) + sequencer musik.
+ * audio.c - bagian dari ps1-shooter, dibuat oleh hidraneseiei21
+ * driver SPU langsung (memory-mapped register) + sequencer musik.
  *
  * Kenapa register langsung? Alamat SPU PS1 itu tetap di hardware, jadi kode
  * ini tidak tergantung nama fungsi / versi header PSn00bSDK.
@@ -95,16 +96,21 @@ static void keyOff(int voice) {
     else            SPU_KEY_OFF_HI = (uint16_t)(1u << (voice - 16));
 }
 
-/* ADSR: attack cepat, sustain penuh, release sedang */
-#define ADSR1_FAST   0x00FF
+/* ADSR untuk SFX: attack instan (respon input harus terasa langsung) */
+#define ADSR1_SFX    0x00FF
+/* [FIX] ADSR untuk instrumen musik: attack RINGAN (AR=2, bukan 0) menghaluskan
+   serangan tiap not sehingga staccato cepat tidak terdengar sebagai klik/dengung
+   "net-net-net". Decay & sustain tetap penuh supaya nada tidak meredup sebelum
+   giliran not berikutnya (step sequencer 100ms @150bpm). */
+#define ADSR1_MUSIC  ((2 << 8) | 0x008F)   /* AR=2 (lembut, ~beberapa ms), DR=8, SL=15 */
 #define ADSR2_MUSIC  0x1FC0
 
-static void voiceSetup(int v, int sampleId, uint32_t pitch, int volL, int volR) {
+static void voiceSetup(int v, int sampleId, uint32_t pitch, int volL, int volR, int isMusic) {
     SPU_VOL_L(v)      = (uint16_t)(volL << 1);   /* skala 0x3FFF max, volume "fixed" */
     SPU_VOL_R(v)      = (uint16_t)(volR << 1);
     SPU_PITCH(v)      = (uint16_t)pitch;
     SPU_STARTADDR(v)  = sampleAddr[sampleId];
-    SPU_ADSR1(v)      = ADSR1_FAST;
+    SPU_ADSR1(v)      = isMusic ? ADSR1_MUSIC : ADSR1_SFX;
     SPU_ADSR2(v)      = ADSR2_MUSIC;
 }
 
@@ -138,7 +144,7 @@ void sfxPlay(int sampleId) {
     int v = sfxNext;
     sfxNext = (sfxNext + 1) % NUM_SFX_VOICES;
     keyOff(v);
-    voiceSetup(v, sampleId, PITCH_FOR_RATE(sampleRate[sampleId]), 0x2400, 0x2400);
+    voiceSetup(v, sampleId, PITCH_FOR_RATE(sampleRate[sampleId]), 0x2400, 0x2400, 0);
     keyOn(v);
 }
 
@@ -220,8 +226,8 @@ static const uint8_t g_kick[64]  = {1,0,0,0, 1,0,0,0, 1,0,0,0, 1,0,0,0, 1,0,0,0,
                                     1,0,0,0, 1,0,0,0, 1,0,0,0, 1,0,0,0, 1,0,0,0, 1,0,0,0, 1,0,0,0, 1,0,1,0};
 static const uint8_t g_snare[64] = {0,0,0,0, 1,0,0,0, 0,0,0,0, 1,0,0,0, 0,0,0,0, 1,0,0,0, 0,0,0,0, 1,0,0,0,
                                     0,0,0,0, 1,0,0,0, 0,0,0,0, 1,0,0,0, 0,0,0,0, 1,0,0,0, 0,0,0,0, 1,0,1,1};
-static const uint8_t g_hat[64]   = {1,0,1,0, 1,0,1,0, 1,0,1,0, 1,0,1,1, 1,0,1,0, 1,0,1,0, 1,0,1,0, 1,0,1,1,
-                                    1,0,1,0, 1,0,1,0, 1,0,1,0, 1,0,1,1, 1,0,1,0, 1,0,1,0, 1,0,1,0, 1,1,1,1};
+static const uint8_t g_hat[64]   = {0,0,1,0, 0,0,1,0, 0,0,1,0, 0,0,1,0, 0,0,1,0, 0,0,1,0, 0,0,1,0, 0,0,1,1,
+                                    0,0,1,0, 0,0,1,0, 0,0,1,0, 0,0,1,0, 0,0,1,0, 0,0,1,0, 0,0,1,0, 0,0,1,1};
 
 /* ===== LAGU 2: BOSS (gelap & agresif, 170 bpm, 32 step = 2 bar) ===== */
 static const int8_t b_lead[32] = {
@@ -238,7 +244,7 @@ static const int8_t b_arp[32] = {
 };
 static const uint8_t b_kick[32]  = {1,0,0,1, 0,0,1,0, 1,0,0,1, 0,0,1,0,  1,0,0,1, 0,0,1,0, 1,0,1,0, 1,0,1,1};
 static const uint8_t b_snare[32] = {0,0,0,0, 1,0,0,0, 0,0,0,0, 1,0,0,1,  0,0,0,0, 1,0,0,0, 0,0,0,0, 1,0,1,1};
-static const uint8_t b_hat[32]   = {1,1,1,1, 1,1,1,1, 1,1,1,1, 1,1,1,1,  1,1,1,1, 1,1,1,1, 1,1,1,1, 1,1,1,1};
+static const uint8_t b_hat[32]   = {0,1,0,1, 0,1,0,1, 0,1,0,1, 0,1,0,1,  0,1,0,1, 0,1,0,1, 0,1,0,1, 0,1,1,1};
 
 static const Song songs[3] = {
     /* MENU */ { 90,  4, 32, m_lead, m_pad, m_bass, m_arp, m_kick, m_snare, m_hat, 0x1400, 0x0C00, 0x2000, 0x0F00 },
@@ -258,17 +264,25 @@ static void seqComputeTiming(const Song *s) {
     seqAcc = 0;
 }
 
+/* [FIX] Nada berturut-turut yang SAMA tidak boleh retrigger: sample instrumen sudah
+   loop tak terbatas di hardware (flag VAG), jadi cukup ubah pitch bila perlu dan
+   biarkan voice terus bermain (legato). Retrigger (keyOff+keyOn) HANYA saat nada
+   benar-benar berganti -> menghilangkan bunyi "cacah/klik" tiap step sequencer. */
+static int lastSemi[15] = { [0 ... 14] = -1000 };   /* per-voice: semitone terakhir yang dimainkan */
+
 static void playNote(int voice, int sampleId, int semi, int vol) {
-    if (semi == R) return;
-    if (semi == H) return;                 /* tahan: biarkan bunyi berlanjut */
+    if (semi == R) { keyOff(voice); lastSemi[voice] = -1000; return; }
+    if (semi == H) return;                          /* tahan eksplisit: jangan sentuh voice */
+    if (semi == lastSemi[voice]) return;             /* nada sama persis: biarkan terus loop */
     keyOff(voice);
-    voiceSetup(voice, sampleId, notePitch(semi), vol, vol);
+    voiceSetup(voice, sampleId, notePitch(semi), vol, vol, 1);
     keyOn(voice);
+    lastSemi[voice] = semi;
 }
 
 static void playDrum(int voice, int sampleId, int vol) {
     keyOff(voice);
-    voiceSetup(voice, sampleId, PITCH_FOR_RATE(AUDIO_RATE), vol, vol);
+    voiceSetup(voice, sampleId, PITCH_FOR_RATE(AUDIO_RATE), vol, vol, 1);
     keyOn(voice);
 }
 
@@ -280,7 +294,7 @@ static void seqStepPlay(const Song *s) {
     playNote(V_ARP,  INS_SAW,  s->arp[i],  s->arpVol);
     if (s->kick[i])  playDrum(V_KICK,  DRM_KICK,  0x2600);
     if (s->snare[i]) playDrum(V_SNARE, DRM_SNARE, 0x2000);
-    if (s->hat[i])   playDrum(V_HAT,   DRM_HAT,   0x0E00);
+    if (s->hat[i])   playDrum(V_HAT,   DRM_HAT,   0x0900);
 }
 
 void musicStop(void) {

@@ -11,12 +11,15 @@
  *   close() biasa dengan path "bu00:NAMA_FILE" (slot 1) atau "bu10:" (slot 2).
  * Fungsi-fungsi ini adalah panggilan BIOS (bukan PSn00bSDK spesifik), jadi
  * seharusnya tersedia lewat <psxapi.h> di semua SDK PS1 termasuk PSn00bSDK.
- * NAMUN ini belum diuji kompilasi di toolchain PS1 sungguhan (lingkungan
- * pengembangan ini tidak punya toolchain MIPS). Kemungkinan penyesuaian:
- *   - Kalau InitCard/StartCard tidak ada, coba InitCARD/StartCARD (kapitalisasi
- *     beda antar versi SDK/dokumentasi).
- *   - Kalau open/read/write/close bentrok dengan libc, mungkin perlu prefix
- *     berbeda atau header <psxetc.h> tambahan.
+ *
+ * UPDATE (setelah uji kompilasi sungguhan di CI, toolchain PSn00bSDK 0.24):
+ *   - InitCard, StartCard, _bu_init, open, close: CONFIRMED tersedia dan
+ *     cocok lewat <psxapi.h>, tidak perlu di-declare ulang manual.
+ *   - read/write: SEBELUMNYA di-declare ulang manual dengan signature
+ *     `int len` di sini, padahal <psxapi.h> sudah mendeklarasikannya dengan
+ *     `size_t len`. Ini menyebabkan "conflicting types" saat build karena
+ *     dianggap dua deklarasi berbeda untuk fungsi yang sama. FIX: deklarasi
+ *     manual read/write dihapus, pakai langsung yang dari <psxapi.h>.
  * Logika checksum & validasi data (bagian yang murni C, tidak sentuh hardware)
  * SUDAH diuji lewat tools/test_save.c dan lulus semua kasus.
  */
@@ -30,13 +33,15 @@
    dari dokumentasi resminya sendiri, per saat kode ini ditulis). Baris-baris
    di bawah memanggil fungsi BIOS standar PS1 (InitCard/StartCard/_bu_init)
    dan fungsi file POSIX-style (open/read/write/close) dengan path "bu00:...",
-   sesuai dokumentasi teknis BIOS PS1 (problemkaputt.de/psxspx). Fungsi ini
-   BELUM diuji kompilasi di toolchain PS1 sungguhan.
-   Kemungkinan perbaikan kalau CI gagal di baris-baris ini:
+   sesuai dokumentasi teknis BIOS PS1 (problemkaputt.de/psxspx).
+   read() dan write() SUDAH tersedia lewat <psxapi.h> (signature pakai
+   size_t), jadi JANGAN di-declare ulang manual di sini - itu penyebab
+   error "conflicting types" yang pernah terjadi di CI.
+   Kemungkinan perbaikan lain kalau CI gagal di baris-baris ini:
    1. Nama fungsi beda kapitalisasi: coba InitCARD/StartCARD.
-   2. open/read/write/close bentrok dgn libc: PSn00bSDK mungkin menyediakan
-      fungsi ini lewat <stdio.h> (FILE*) alih-alih deskriptor int mentah -
-      dalam kasus itu perlu ditulis ulang pakai fopen("bu00:...", "r+b") dkk.
+   2. open/close bentrok dgn libc: PSn00bSDK mungkin menyediakan fungsi ini
+      lewat <stdio.h> (FILE*) alih-alih deskriptor int mentah - dalam kasus
+      itu perlu ditulis ulang pakai fopen("bu00:...", "r+b") dkk.
    3. Kalau semua opsi gagal: set SAVE_FORCE_DISABLE 1 di bawah supaya game
       tetap kompil dan jalan TANPA fitur save, sambil dicari solusi lebih
       lanjut - ini lebih baik daripada build gagal total. */
@@ -48,8 +53,8 @@ extern void StartCard(void);
 extern void _bu_init(void);
 extern int open(const char *name, int mode);
 extern int close(int fd);
-extern int read(int fd, void *buf, int len);
-extern int write(int fd, const void *buf, int len);
+/* read() dan write() SUDAH dideklarasikan di <psxapi.h> dengan signature
+   size_t - JANGAN declare ulang di sini, akan bentrok (conflicting types). */
 #endif
 
 /* mode file BIOS: 0x0002 = O_RDWR, bit9 (0x200) = "buat baru dgn ukuran",

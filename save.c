@@ -112,9 +112,9 @@ static int cardReady = 0;
 
 static void ensureCardInit(void) {
     if (cardReady) return;
-    InitCard(1);
-    StartCard();
-    _bu_init();
+    init_card(1);    // Menggunakan huruf kecil
+    start_card();   // Menggunakan huruf kecil
+    _bu_init();     // Tetap sama
     cardReady = 1;
 }
 

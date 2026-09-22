@@ -7,5 +7,5 @@ project(
     DESCRIPTION  "PS1 space shooter"
 )
 
-psn00bsdk_add_executable(shooter GPREL main.c audio.c)
+psn00bsdk_add_executable(shooter GPREL main.c render.c audio.c save.c)
 psn00bsdk_add_cd_image(iso shooter iso.xml DEPENDS shooter ${PROJECT_SOURCE_DIR}/system.cnf)

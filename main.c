@@ -6,22 +6,8 @@
 #include <psxpad.h>
 #include <psxapi.h>
 #include "audio.h"
-
-#define OT_LEN     10
-#define BUFFER_LEN 131072
-#define SCREEN_W   320
-#define SCREEN_H   240
-
-typedef struct {
-    DISPENV  disp;
-    DRAWENV  draw;
-    uint32_t ot[OT_LEN];
-    uint8_t  buf[BUFFER_LEN];
-} RenderBuffer;
-
-static RenderBuffer buffers[2];
-static uint8_t     *nextpri;
-static int          active;
+#include "save.h"
+#include "render.h"
 
 #define MAX_PLAYERS 4
 static uint8_t padbuf[2][34];
@@ -30,9 +16,6 @@ static uint16_t prevBtn[MAX_PLAYERS] = { 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF };
 /* [FIX] hitbox pemain dulu magic number "16,16" ditulis berulang di banyak tempat */
 #define PLAYER_W 16
 #define PLAYER_H 16
-
-enum { L_OVERLAY = 0, L_HUD_TOP = 1, L_HUD_BASE = 2, L_GLOW = 3, L_FX = 4, L_PLAYER = 5,
-       L_BULLET = 6, L_ENEMY = 7, L_PLANET = 8, L_BG = 9 };
 
 /* [FIX] Enemy: tambah vy, tx, ty, buff untuk kebutuhan 6 musuh baru
    (vy/tx/ty dipakai Charger buat simpan arah & target dash,
@@ -150,7 +133,7 @@ static Mine      mines[MAX_MINES];   /* [BARU] */
 static int shootX = -100, shootY = 0, shootT = 0;
 
 /* [POLISH] jendela teks berposisi tetap (ID dari FntOpen). Tidak lagi bergantung hitungan \n. */
-static int fntTop = -1, fntMid = -1, fntBot = -1;
+static int fntTop = -1, fntMid = -1, fntBot = -1, fntScore = -1;
 
 static const int playerColor[MAX_PLAYERS][3] = {
     {  80, 160, 255 },
@@ -159,33 +142,9 @@ static const int playerColor[MAX_PLAYERS][3] = {
     { 255, 220,  80 }
 };
 
-static const int8_t sin16[16] = {
-    0, 49, 90, 117, 127, 117, 90, 49, 0, -49, -90, -117, -127, -117, -90, -49
-};
-static int sinI(int t) { return sin16[t & 15]; }
-static int cosI(int t) { return sin16[(t + 4) & 15]; }
-
-static const int8_t sinTab[32] = {
-    0, 24, 48, 70, 89, 105, 116, 124, 127, 124, 116, 105, 89, 70, 48, 24,
-    0, -24, -48, -70, -89, -105, -116, -124, -127, -124, -116, -105, -89, -70, -48, -24
-};
-static int sinS(int t) { return sinTab[t & 31]; }
-
-static const int8_t sin64[64] = {
-    0, 12, 25, 37, 49, 60, 71, 81, 90, 98, 106, 112, 117, 122, 125, 126,
-    127, 126, 125, 122, 117, 112, 106, 98, 90, 81, 71, 60, 49, 37, 25, 12,
-    0, -12, -25, -37, -49, -60, -71, -81, -90, -98, -106, -112, -117, -122, -125, -126,
-    -127, -126, -125, -122, -117, -112, -106, -98, -90, -81, -71, -60, -49, -37, -25, -12
-};
-static int sinO(int t) { return sin64[t & 63]; }
-static int cosO(int t) { return sin64[(t + 16) & 63]; }
-
 static int pressedP(int pl, uint16_t btn, uint16_t mask) {
     return !(btn & mask) && (prevBtn[pl] & mask);
 }
-
-/* offset DRAWENV asli tiap buffer (posisi di VRAM). Shake ditambahkan ke ini, tidak menggantikan. */
-static int16_t baseOfs[2][2];
 
 static void initVideo(void) {
     ResetGraph(0);
@@ -283,199 +242,6 @@ static int shakeOffsetY(int frame) { return shakeMag ? (((frame >> 1) & 1) ? sha
    sekali -> berisiko overflow diam-diam & merusak struct RenderBuffer lain. */
 /* [FASE 3] 2 KB terakhir buffer dicadangkan khusus untuk overlay (fade/flash) supaya
    transisi layar tidak pernah gagal tergambar, walau adegan sedang sangat padat. */
-#define PRIM_RESERVE 2048
-static int primOverlayMode = 0;    /* 1 = sedang menggambar overlay: boleh pakai cadangan */
-static int primPeak = 0;           /* pemakaian puncak (byte) sejak boot, untuk debug */
-
-static void *primAlloc(int size) {
-    uint8_t *base = buffers[active].buf;
-    int limit = BUFFER_LEN - (primOverlayMode ? 0 : PRIM_RESERVE);
-    if (nextpri + size > base + limit) return NULL; /* penuh: lewati gambar daripada merusak memori */
-    void *p = nextpri;
-    nextpri += size;
-    {
-        int used = (int)(nextpri - base);
-        if (used > primPeak) primPeak = used;
-    }
-    return p;
-}
-
-static int clamp255(int v) { return v < 0 ? 0 : (v > 255 ? 255 : v); }
-
-static void rect(int layer, int x, int y, int w, int h, int r, int g, int b) {
-    TILE *t = (TILE *)primAlloc(sizeof(TILE));
-    if (!t) return;
-    setTile(t);
-    setXY0(t, x, y);
-    setWH(t, w, h);
-    setRGB0(t, clamp255(r), clamp255(g), clamp255(b));
-    addPrim(&buffers[active].ot[layer], t);
-}
-
-static void tri(int layer,
-                int x0, int y0, int r0, int g0, int b0,
-                int x1, int y1, int r1, int g1, int b1,
-                int x2, int y2, int r2, int g2, int b2) {
-    POLY_G3 *p = (POLY_G3 *)primAlloc(sizeof(POLY_G3));
-    if (!p) return;
-    setPolyG3(p);
-    setXY3(p, x0, y0, x1, y1, x2, y2);
-    setRGB0(p, clamp255(r0), clamp255(g0), clamp255(b0));
-    setRGB1(p, clamp255(r1), clamp255(g1), clamp255(b1));
-    setRGB2(p, clamp255(r2), clamp255(g2), clamp255(b2));
-    addPrim(&buffers[active].ot[layer], p);
-}
-
-static void rectGradV(int layer, int x, int y, int w, int h,
-                      int r0, int g0, int b0, int r1, int g1, int b1) {
-    POLY_G4 *p = (POLY_G4 *)primAlloc(sizeof(POLY_G4));
-    if (!p) return;
-    setPolyG4(p);
-    setXY4(p, x, y, x + w, y, x, y + h, x + w, y + h);
-    setRGB0(p, clamp255(r0), clamp255(g0), clamp255(b0));
-    setRGB1(p, clamp255(r0), clamp255(g0), clamp255(b0));
-    setRGB2(p, clamp255(r1), clamp255(g1), clamp255(b1));
-    setRGB3(p, clamp255(r1), clamp255(g1), clamp255(b1));
-    addPrim(&buffers[active].ot[layer], p);
-}
-
-static void setBlendMode(int layer, int mode) {
-    DR_TPAGE *p = (DR_TPAGE *)primAlloc(sizeof(DR_TPAGE));
-    if (!p) return;
-    setDrawTPage(p, 0, 1, getTPage(0, mode, 0, 0));
-    addPrim(&buffers[active].ot[layer], p);
-}
-
-static void disc(int layer, int cx, int cy, int rad,
-                 int cr, int cg, int cb, int er, int eg, int eb) {
-    for (int i = 0; i < 16; i++) {
-        int x1 = cx + cosI(i)     * rad / 127;
-        int y1 = cy + sinI(i)     * rad / 127;
-        int x2 = cx + cosI(i + 1) * rad / 127;
-        int y2 = cy + sinI(i + 1) * rad / 127;
-        tri(layer, cx, cy, cr, cg, cb, x1, y1, er, eg, eb, x2, y2, er, eg, eb);
-    }
-}
-
-static void discLo(int layer, int cx, int cy, int rad,
-                   int cr, int cg, int cb, int er, int eg, int eb) {
-    for (int i = 0; i < 16; i += 2) {
-        int x1 = cx + cosI(i)     * rad / 127;
-        int y1 = cy + sinI(i)     * rad / 127;
-        int x2 = cx + cosI(i + 2) * rad / 127;
-        int y2 = cy + sinI(i + 2) * rad / 127;
-        tri(layer, cx, cy, cr, cg, cb, x1, y1, er, eg, eb, x2, y2, er, eg, eb);
-    }
-}
-
-static void glowDisc(int cx, int cy, int rad, int r, int g, int b, int sides) {
-    int step = 16 / sides; if (step < 1) step = 1;
-    for (int i = 0; i < 16; i += step) {
-        int x1 = cx + cosI(i)        * rad / 127;
-        int y1 = cy + sinI(i)        * rad / 127;
-        int x2 = cx + cosI(i + step) * rad / 127;
-        int y2 = cy + sinI(i + step) * rad / 127;
-        POLY_G3 *p = (POLY_G3 *)primAlloc(sizeof(POLY_G3));
-        if (!p) return;
-        setPolyG3(p);
-        setSemiTrans(p, 1);
-        setXY3(p, cx, cy, x1, y1, x2, y2);
-        setRGB0(p, clamp255(r), clamp255(g), clamp255(b));
-        setRGB1(p, 0, 0, 0);
-        setRGB2(p, 0, 0, 0);
-        addPrim(&buffers[active].ot[L_GLOW], p);
-    }
-}
-
-static void burst(int layer, int cx, int cy, int rOut, int rIn, int rot,
-                  int cr, int cg, int cb, int er, int eg, int eb) {
-    for (int i = 0; i < 8; i++) {
-        int a0 = (i * 2 + rot) & 15;
-        int a1 = (i * 2 + 1 + rot) & 15;
-        int a2 = (i * 2 + 2 + rot) & 15;
-        int xo = cx + cosI(a1) * rOut / 127;
-        int yo = cy + sinI(a1) * rOut / 127;
-        int xa = cx + cosI(a0) * rIn / 127;
-        int ya = cy + sinI(a0) * rIn / 127;
-        int xb = cx + cosI(a2) * rIn / 127;
-        int yb = cy + sinI(a2) * rIn / 127;
-        tri(layer, xo, yo, er, eg, eb, xa, ya, cr, cg, cb, xb, yb, cr, cg, cb);
-    }
-}
-
-static void beamQuad(int layer, int cx, int cy, int angle, int len, int thick,
-                     int r, int g, int b, int trans) {
-    int dx = cosI(angle), dy = sinI(angle);
-    int nx = -dy, ny = dx;
-    int hx1 = cx + dx * len / 127, hy1 = cy + dy * len / 127;
-    int hx2 = cx - dx * len / 127, hy2 = cy - dy * len / 127;
-    int ox = nx * thick / 254, oy = ny * thick / 254;
-    POLY_F4 *p = (POLY_F4 *)primAlloc(sizeof(POLY_F4));
-    if (!p) return;
-    setPolyF4(p);
-    if (trans) setSemiTrans(p, 1);
-    setXY4(p, hx1 + ox, hy1 + oy, hx1 - ox, hy1 - oy, hx2 + ox, hy2 + oy, hx2 - ox, hy2 - oy);
-    setRGB0(p, clamp255(r), clamp255(g), clamp255(b));
-    addPrim(&buffers[active].ot[layer], p);
-}
-
-static int beamHit(int bx, int by, int angle, int len, int halfThick, int px, int py) {
-    int dx = cosI(angle), dy = sinI(angle);
-    int rx = px - bx, ry = py - by;
-    int along = (rx * dx + ry * dy) / 127;
-    if (along < -len || along > len) return 0;
-    int cross = rx * dy - ry * dx;
-    if (cross < 0) cross = -cross;
-    return (cross / 127) < halfThick;
-}
-
-/* [BARU] normalisasi arah tanpa sqrt (Chebyshev-scaled) - dipakai musuh
-   Turret & Absorber untuk menembak terarah ke posisi pemain */
-static void aimVector(int fromX, int fromY, int toX, int toY, int speed, int *outVx, int *outVy) {
-    int dx = toX - fromX, dy = toY - fromY;
-    int adx = dx < 0 ? -dx : dx;
-    int ady = dy < 0 ? -dy : dy;
-    int m = adx > ady ? adx : ady;
-    if (m == 0) { *outVx = 0; *outVy = speed; return; }
-    *outVx = dx * speed / m;
-    *outVy = dy * speed / m;
-}
-
-/* ---------- UI melengkung ---------- */
-
-static void flatRect(int layer, int x, int y, int w, int h,
-                     int r, int g, int b, int trans) {
-    POLY_F4 *p = (POLY_F4 *)primAlloc(sizeof(POLY_F4));
-    if (!p) return;
-    setPolyF4(p);
-    if (trans) setSemiTrans(p, 1);
-    setXY4(p, x, y, x + w, y, x, y + h, x + w, y + h);
-    setRGB0(p, clamp255(r), clamp255(g), clamp255(b));
-    addPrim(&buffers[active].ot[layer], p);
-}
-
-static void quarterDisc(int layer, int cx, int cy, int rad, int q,
-                        int r, int g, int b, int trans) {
-    int base = q * 4;
-    for (int i = 0; i < 4; i++) {
-        int x1 = cx + cosI(base + i)     * rad / 127;
-        int y1 = cy + sinI(base + i)     * rad / 127;
-        int x2 = cx + cosI(base + i + 1) * rad / 127;
-        int y2 = cy + sinI(base + i + 1) * rad / 127;
-        POLY_G3 *p = (POLY_G3 *)primAlloc(sizeof(POLY_G3));
-        if (!p) return;
-        setPolyG3(p);
-        if (trans) setSemiTrans(p, 1);
-        setXY3(p, cx, cy, x1, y1, x2, y2);
-        setRGB0(p, clamp255(r), clamp255(g), clamp255(b));
-        setRGB1(p, clamp255(r), clamp255(g), clamp255(b));
-        setRGB2(p, clamp255(r), clamp255(g), clamp255(b));
-        addPrim(&buffers[active].ot[layer], p);
-    }
-}
-
-/* [FASE 3] penerap shake: tambahkan offset ke offset DASAR buffer yang sedang digambar.
-   Dipanggil tepat sebelum flip() (flip memakai buffers[active].draw). */
 static void fxApplyShake(int frame) {
     buffers[active].draw.ofs[0] = baseOfs[active][0] + shakeOffsetX(frame);
     buffers[active].draw.ofs[1] = baseOfs[active][1] + shakeOffsetY(frame);
@@ -501,52 +267,86 @@ static void fxDraw(void) {
     primOverlayMode = 0;
 }
 
-static void roundedPanel(int layer, int x, int y, int w, int h, int rad,
-                         int r, int g, int b, int trans) {
-    flatRect(layer, x + rad, y, w - 2 * rad, h, r, g, b, trans);
-    flatRect(layer, x, y + rad, rad, h - 2 * rad, r, g, b, trans);
-    flatRect(layer, x + w - rad, y + rad, rad, h - 2 * rad, r, g, b, trans);
-    quarterDisc(layer, x + rad,       y + rad,       rad, 2, r, g, b, trans);
-    quarterDisc(layer, x + w - rad,   y + rad,       rad, 3, r, g, b, trans);
-    quarterDisc(layer, x + rad,       y + h - rad,   rad, 1, r, g, b, trans);
-    quarterDisc(layer, x + w - rad,   y + h - rad,   rad, 0, r, g, b, trans);
-}
-
 /* ---------- Planet ---------- */
 
 /* [POLISH] Planet: sisi gelap tetap berwarna (tidak hitam), tepi memberi cincin atmosfer,
    dan ada pita permukaan supaya tampak seperti planet gas, bukan segi-8 hitam polos. */
+/* [DETAIL] Planet 64-segmen (dulu 16) untuk siluet lebih bulat/halus, dengan
+   3 lapis: inti bershading gradien halus, pita awan mengikuti kurva lengkung
+   permukaan (bukan garis lurus), dan atmosfer 3-lapis (dalam->luar) untuk
+   kesan kedalaman, bukan satu glow datar. */
 static void planetSphere(int cx, int cy, int rad,
                          int litR, int litG, int litB,
                          int darkR, int darkG, int darkB) {
-    /* lantai warna sisi gelap: minimal 35% warna terang agar tidak pernah jadi lubang hitam */
-    int fR = litR * 35 / 100, fG = litG * 35 / 100, fB = litB * 35 / 100;
+    int fR = litR * 32 / 100, fG = litG * 32 / 100, fB = litB * 32 / 100;
     if (darkR < fR) darkR = fR;
     if (darkG < fG) darkG = fG;
     if (darkB < fB) darkB = fB;
-    for (int i = 0; i < 16; i++) {
-        int x1 = cx + cosI(i)     * rad / 127;
-        int y1 = cy + sinI(i)     * rad / 127;
-        int x2 = cx + cosI(i + 1) * rad / 127;
-        int y2 = cy + sinI(i + 1) * rad / 127;
-        int litAmt = (-cosI(i) + 127);                 /* sisi terang menghadap kiri-atas (matahari) */
-        litAmt = (litAmt + (-sinI(i) + 127)) / 2;
+
+    /* inti: 64 segmen, shading dari arah cahaya kiri-atas, dengan sedikit
+       terminator lebih tajam (pow-ish) supaya batas siang/malam lebih jelas
+       ketimbang gradien linear datar */
+    for (int i = 0; i < 64; i++) {
+        int x1 = cx + cosO(i)     * rad / 127;
+        int y1 = cy + sinO(i)     * rad / 127;
+        int x2 = cx + cosO(i + 1) * rad / 127;
+        int y2 = cy + sinO(i + 1) * rad / 127;
+        int litAmt = (-cosO(i) + 127);
+        litAmt = (litAmt * 3 + (-sinO(i) + 127)) / 4;   /* bobot lebih ke horizontal = terminator lebih tajam */
+        if (litAmt < 0) litAmt = 0;
+        if (litAmt > 254) litAmt = 254;
         int r = darkR + (litR - darkR) * litAmt / 254;
         int g = darkG + (litG - darkG) * litAmt / 254;
         int b = darkB + (litB - darkB) * litAmt / 254;
+        int er = r * 55 / 100, eg = g * 55 / 100, eb = b * 55 / 100;   /* tepi sedikit lebih gelap dari tengah */
         tri(L_PLANET, cx, cy, r, g, b,
-                      x1, y1, r * 2 / 3, g * 2 / 3, b * 2 / 3,
-                      x2, y2, r * 2 / 3, g * 2 / 3, b * 2 / 3);
+                      x1, y1, er, eg, eb,
+                      x2, y2, er, eg, eb);
     }
-    /* pita permukaan (2 garis miring lembut) */
-    for (int k = -1; k <= 1; k += 2) {
-        int yy = cy + k * rad / 3;
-        int hw = rad * 8 / 10;
-        rect(L_PLANET, cx - hw, yy, hw * 2, 1, litR * 6 / 10, litG * 6 / 10, litB * 6 / 10);
+
+    /* [FIX] Pita awan: irisan elips HORIZONTAL pada beberapa ketinggian,
+       bukan busur sudut 0..360 (itu penyebab bug "garis silang seperti
+       bintang" pada render sebelumnya). Untuk tiap ketinggian y relatif
+       pusat, lebar pita di titik itu = rad*cos(asin(y/rad)) -> pakai tabel
+       sinus terbalik sederhana lewat sinO/cosO berpasangan. */
+    for (int band = 0; band < 3; band++) {
+        int hy = (-rad / 2) + band * (rad / 2);              /* ketinggian pita relatif pusat: atas, tengah, bawah */
+        if (hy <= -rad || hy >= rad) continue;
+        /* cari sudut ang di mana sinO(ang)*rad/127 == hy, dengan mencari nilai
+           terdekat di tabel 64-segmen (cukup presisi untuk ukuran planet kita) */
+        int bestAng = 0, bestDiff = 99999;
+        for (int a = 0; a < 32; a++) {                        /* 0..31 = setengah atas tabel (y dari -rad..+rad) */
+            int yy = sinO(a) * rad / 127;
+            int diff = yy - hy; if (diff < 0) diff = -diff;
+            if (diff < bestDiff) { bestDiff = diff; bestAng = a; }
+        }
+        int halfW = cosO(bestAng) * rad / 127;                /* setengah lebar pita di ketinggian ini */
+        if (halfW < 0) halfW = -halfW;
+        if (halfW < 3) continue;
+        int bandLit  = litR * (50 + band * 12) / 100;
+        int bandLitG = litG * (50 + band * 12) / 100;
+        int bandLitB = litB * (50 + band * 12) / 100;
+        int thick = (band == 1) ? 2 : 1;                       /* pita tengah sedikit lebih tebal */
+        rect(L_PLANET, cx - halfW, cy + hy, halfW * 2, thick, bandLit, bandLitG, bandLitB);
     }
-    /* atmosfer: kilau additive di tepi + sorot matahari */
-    glowDisc(cx, cy, rad + 5, litR / 2, litG / 2, litB / 2, 8);
-    glowDisc(cx - rad / 3, cy - rad / 3, rad / 2 + 4, litR, litG, litB, 8);
+
+    /* atmosfer 3-lapis: dalam (rapat,terang) -> tengah -> luar (lebar,redup).
+       Ini yang memberi kesan "bercahaya dari dalam" alih-alih 1 lingkaran blur. */
+    /* [FIX] Gradien radial (Gouraud triangle-fan) pada radius besar secara
+       inheren menghasilkan pola "starburst" 8-arah (Mach banding di tepi
+       segitiga - fenomena optik nyata, bukan bug; efek serupa juga muncul di
+       banyak game PS1 asli). Sudah dicoba: menambah segmen (64 vs 16) TIDAK
+       menghilangkannya, menumpuk banyak lapis MEMPERPARAH. Solusi yang
+       terbukti efektif dari eksperimen: pakai HANYA 1 lapis tipis, radius
+       dekat dengan planet (bukan jauh melebar), dan redupkan drastis supaya
+       starburst tetap ada tapi halus/tidak dominan - berkesan seperti
+       corona/atmosfer redup, bukan lens-flare mencolok. */
+    glowDiscHD(cx, cy, rad + 6, litR * 3 / 10, litG * 3 / 10, litB * 3 / 10);
+    /* sorot matahari: highlight kecil & terang di sisi yang menghadap cahaya.
+       Radius dikecilkan signifikan (dulu rad/2+4 ~ terlalu besar utk planet
+       gede, jadi starburst kedua yg tumpang tindih dgn atmosfer). */
+    glowDiscHD(cx - rad / 3, cy - rad / 3, rad / 4, litR * 6 / 10, litG * 6 / 10, litB * 6 / 10);
+    glowDiscHD(cx - rad / 3, cy - rad / 3, rad / 8, 255, 255, 240);   /* highlight inti kecil, hampir putih */
 }
 
 /* ---------- Starfield ---------- */
@@ -733,6 +533,7 @@ static int skinCursor  = 0;
 
 #define GACHA_COST 50
 static int gems = 0;
+static int highScore = 0;   /* dimuat dari memory card saat boot, ditampilkan di menu */
 static int gachaResultSkin = -1;
 static int gachaResultDup  = 0;
 static int gachaFlashT     = 0;
@@ -756,6 +557,18 @@ static int gachaRoll(void) {
     return pool[rand() % n];
 }
 
+/* [SAVE] Kumpulkan state saat ini & tulis ke memory card. Dipanggil hanya di
+   titik-titik aman (bukan tiap frame) karena I/O memory card lambat & tidak
+   perlu presisi real-time. Gagal diam-diam bila kartu tidak ada (lihat save.c). */
+static void persistProgress(void) {
+    SaveData sd;
+    sd.highScore    = highScore;
+    sd.gems         = gems;
+    sd.unlockedMask = unlockedMask;
+    sd.lastSkin     = skinCursor;
+    saveWrite(&sd);
+}
+
 static int doGachaPull(void) {
     if (gems < GACHA_COST) return 0;
     gems -= GACHA_COST;
@@ -763,6 +576,7 @@ static int doGachaPull(void) {
     gachaResultSkin = idx;
     if (unlockedMask & (1u << idx)) { gachaResultDup = 1; gems += 15; }
     else { gachaResultDup = 0; unlockedMask |= (1u << idx); }
+    persistProgress();
     return 1;
 }
 
@@ -1468,25 +1282,33 @@ static void uiPanel(int x, int y, int w, int h, int r, int g, int b) {
 }
 
 static void drawMenu(int frame, int nPlayers) {
-    /* judul: pita gradien + kilau, bukan kotak jingga kosong */
     int bob = sinS(frame / 2) / 20;
-    glowDisc(160, 66, 70, 255, 150, 50, 8);
-    rectGradV(L_HUD_BASE, 30, 44, 260, 44, 40, 20, 90, 12, 8, 40);
-    rect(L_HUD_TOP, 30, 44, 260, 1, 120, 200, 255);
-    rect(L_HUD_TOP, 30, 87, 260, 1, 255, 150, 50);
-    /* garis kecepatan dekoratif di kiri-kanan judul */
-    for (int i = 0; i < 4; i++) {
-        int len = 18 + ((frame / 2 + i * 7) % 24);
-        rect(L_HUD_TOP, 30 - len, 52 + i * 9, len, 1, 80, 160, 255);
-        rect(L_HUD_TOP, 290,      52 + i * 9, len, 1, 80, 160, 255);
+
+    /* [FIX] panel judul: dulu glowDisc raksasa (radius 70) menimpa seluruh panel
+       jadi kelihatan kotak jingga solid kosong. Sekarang pakai uiPanel yang sama
+       dengan panel lain (konsisten) + glow KECIL di belakang teks saja. */
+    uiPanel(24, 6, 272, 34, 255, 170, 60);
+    glowDisc(45, 20, 12, 255, 170, 60, 8);     /* kilau kecil di pojok kiri panel, bukan menutupi semua */
+
+    /* garis kecepatan dekoratif kiri-kanan, di bawah panel judul (tidak menimpanya) */
+    for (int i = 0; i < 3; i++) {
+        int len = 14 + ((frame / 2 + i * 7) % 18);
+        int yy = 46 + i * 8;
+        rect(L_HUD_TOP, 24 - len, yy, len, 1, 80, 160, 255);
+        rect(L_HUD_TOP, 296,      yy, len, 1, 80, 160, 255);
     }
+
     int n = nPlayers < 1 ? 1 : nPlayers;
     for (int p = 0; p < n; p++) {
         int x = SCREEN_W / 2 - 8 + (p * 44 - (n - 1) * 22);
         drawPlayer(x, 128 + bob, frame, players[p].skin);
     }
+
+    /* skor tertinggi tersimpan, ditampilkan di bawah pesawat, di atas panel petunjuk */
+    uiPanel(70, 158, 180, 24, 255, 220, 100);
+
     /* panel petunjuk di bawah */
-    uiPanel(20, 186, 280, 44, 80, 160, 255);
+    uiPanel(20, 190, 280, 42, 80, 160, 255);
 }
 
 static void drawGachaScreen(int frame) {
@@ -1824,6 +1646,7 @@ int main(void) {
     fntTop = FntOpen(8,   8, SCREEN_W - 16,  24, 0, 96);
     fntMid = FntOpen(24, 96, SCREEN_W - 48, 100, 0, 320);
     fntBot = FntOpen(28, 192, SCREEN_W - 56,  40, 0, 240);
+    fntScore = FntOpen(76, 163, SCREEN_W - 152, 16, 0, 64);
 
     InitPAD(padbuf[0], 34, padbuf[1], 34);
     StartPAD();
@@ -1831,6 +1654,19 @@ int main(void) {
     audioInit();
     musicPlay(SONG_MENU);
     fxFadeInNow();
+
+    /* [SAVE] Muat progres dari memory card. Aman-gagal: kalau tidak ada
+       kartu atau data korup, semua variabel dibiarkan di nilai default
+       (0, hanya skin 0 terbuka) dan game tetap jalan normal. */
+    {
+        SaveData sd;
+        saveLoad(&sd);
+        highScore    = sd.highScore;
+        gems         = sd.gems;
+        unlockedMask = sd.unlockedMask;
+        if (sd.lastSkin >= 0 && sd.lastSkin < NUM_SKINS && (unlockedMask & (1u << sd.lastSkin)))
+            skinCursor = sd.lastSkin;
+    }
 
     for (int p = 0; p < MAX_PLAYERS; p++) {
         players[p].active = 0;
@@ -2581,6 +2417,8 @@ int main(void) {
 
             if (countAlive() == 0) {
                 awardGems(totalScore());
+                if (totalScore() > highScore) highScore = totalScore();
+                persistProgress();
                 fxFlash(10);
                 fxShake(SHAKE_MAX);
                 state = STATE_GAMEOVER;
@@ -2595,8 +2433,10 @@ int main(void) {
             if (connected[0]) {
                 if (pressedP(0, btn[0], PAD_LEFT))  { skinCursor = (skinCursor + NUM_SKINS - 1) % NUM_SKINS; sfxPlay(SND_MENU_MOVE); }
                 if (pressedP(0, btn[0], PAD_RIGHT)) skinCursor = (skinCursor + 1) % NUM_SKINS;
-                if (pressedP(0, btn[0], PAD_CROSS) && (unlockedMask & (1u << skinCursor)))
+                if (pressedP(0, btn[0], PAD_CROSS) && (unlockedMask & (1u << skinCursor))) {
                     players[0].skin = skinCursor;
+                    persistProgress();
+                }
                 if (!fading && pressedP(0, btn[0], PAD_CIRCLE)) fxFadeTo(STATE_MENU);
             }
         } else {
@@ -2706,34 +2546,57 @@ int main(void) {
 
         /* ---------- Teks (jendela berposisi tetap) ---------- */
         if (state == STATE_MENU) {
+            /* [FIX] Semua baris disusun dulu ke SATU buffer lalu SATU kali FntPrint.
+               Sebelumnya banyak FntPrint terpisah ke jendela sama -> posisi kursor
+               font tidak terjamin urut, hasilnya baris saling tabrakan/tertimpa. */
             int n = countActive();
-            FntPrint(fntTop, "SPACE SHOOTER\nby hidraneseiei21");
-            FntPrint(fntMid, "");
-            if (n == 0) FntPrint(fntBot, "1P PRESS START TO JOIN\n");
-            else        FntPrint(fntBot, "%d PLAYER%s  X=MULAI\n", n, n > 1 ? "S" : "");
+            char topbuf[32];
+            snprintf(topbuf, sizeof(topbuf), "SPACE SHOOTER");
+            FntPrint(fntTop, "%s", topbuf);
+
+            char botbuf[128];
+            int len = 0;
+            if (n == 0) len += snprintf(botbuf + len, sizeof(botbuf) - len, "1P PRESS START TO JOIN\n");
+            else        len += snprintf(botbuf + len, sizeof(botbuf) - len, "%d PLAYER%s  X=MULAI\n", n, n > 1 ? "S" : "");
             for (int p = 1; p < MAX_PLAYERS; p++)
-                if (connected[p] && !players[p].active) { FntPrint(fntBot, "%dP: START=JOIN  ", p + 1); }
-            FntPrint(fntBot, "\nSEL=GACHA SQR=SKIN GEMS %d", gems);
+                if (connected[p] && !players[p].active && len < (int)sizeof(botbuf) - 20)
+                    len += snprintf(botbuf + len, sizeof(botbuf) - len, "%dP:START ", p + 1);
+            len += snprintf(botbuf + len, sizeof(botbuf) - len, "\nGACHA=SEL SKIN=SQR  GEMS %d", gems);
+            FntPrint(fntBot, "%s", botbuf);
+
+            if (highScore > 0) FntPrint(fntScore, "HIGH SCORE %d", highScore);
+            else                FntPrint(fntScore, "");
+            FntPrint(fntMid, "");
         } else if (state == STATE_PLAY) {
             FntPrint(fntTop, "TOTAL %d   GEMS %d", totalScore(), gems);
+            FntPrint(fntScore, "");
+            FntPrint(fntMid, "");
         } else if (state == STATE_GACHA) {
             FntPrint(fntTop, "GACHA   GEMS %d", gems);
             if (gachaFlashT > 0)
                 FntPrint(fntMid, "\n\n\n\n\n%s%s", skinTable[gachaResultSkin].name,
                          gachaResultDup ? " (DUP +15)" : " UNLOCKED!");
+            else
+                FntPrint(fntMid, "");
             FntPrint(fntBot, "X=PULL (%d)  O=KEMBALI", GACHA_COST);
+            FntPrint(fntScore, "");
         } else if (state == STATE_SKINSELECT) {
             FntPrint(fntTop, "PILIH SKIN (P1)");
             FntPrint(fntBot, "%s%s\nX=PILIH O=KEMBALI", skinTable[skinCursor].name,
                      (unlockedMask & (1u << skinCursor)) ? "" : " (TERKUNCI)");
+            FntPrint(fntScore, "");
+            FntPrint(fntMid, "");
         } else {
             FntPrint(fntTop, "TOTAL %d", totalScore());
-            FntPrint(fntMid, "      GAME OVER\n\n      FINAL SCORE %d\n\n      GEMS +%d\n\n      hidraneseiei21", totalScore(), totalScore() / 2 + 5);
+            FntPrint(fntMid, "      GAME OVER\n\n      FINAL SCORE %d\n\n      GEMS +%d%s", totalScore(), totalScore() / 2 + 5,
+                     totalScore() > highScore ? "\n\n      HIGH SCORE BARU!" : "");
             FntPrint(fntBot, "    PRESS START");
+            FntPrint(fntScore, "");
         }
         FntFlush(fntTop);
         FntFlush(fntMid);
         FntFlush(fntBot);
+        FntFlush(fntScore);
 
         audioUpdate();
         setBlendMode(L_GLOW, 1);

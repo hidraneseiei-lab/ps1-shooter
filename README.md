@@ -12,6 +12,12 @@ Space shooter untuk PlayStation 1, dibuat dengan PSn00bSDK.
 - Efek layar: screen shake, flash, fade transisi
 - Latar tema warna yang berubah tiap 2 level
 
+## Struktur file
+- `main.c` - logika game: state, musuh, pemain, input, tabrakan
+- `render.c` / `render.h` - primitif gambar tingkat rendah (segitiga, disc, panel) + buffer VRAM
+- `audio.c` / `audio.h` - driver SPU + sequencer musik & SFX prosedural
+- `save.c` / `save.h` - simpan progres ke memory card (high score, gems, skin)
+
 ## Build
 Lihat `.github/workflows/build.yml` untuk proses build otomatis via GitHub Actions,
 atau build lokal dengan PSn00bSDK + CMake + Ninja.

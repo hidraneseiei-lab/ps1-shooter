@@ -29,33 +29,34 @@
 #include "save.h"
 
 /* [PENTING - BACA INI KALAU BUILD GAGAL DI FILE INI]
-   PSn00bSDK belum punya library memory card resmi yang lengkap (dikonfirmasi
-   dari dokumentasi resminya sendiri, per saat kode ini ditulis). Baris-baris
-   di bawah memanggil fungsi BIOS standar PS1 (InitCard/StartCard/_bu_init)
-   dan fungsi file POSIX-style (open/read/write/close) dengan path "bu00:...",
-   sesuai dokumentasi teknis BIOS PS1 (problemkaputt.de/psxspx).
-   read() dan write() SUDAH tersedia lewat <psxapi.h> (signature pakai
-   size_t), jadi JANGAN di-declare ulang manual di sini - itu penyebab
-   error "conflicting types" yang pernah terjadi di CI.
-   Kemungkinan perbaikan lain kalau CI gagal di baris-baris ini:
-   1. Nama fungsi beda kapitalisasi: coba InitCARD/StartCARD.
-   2. open/close bentrok dgn libc: PSn00bSDK mungkin menyediakan fungsi ini
-      lewat <stdio.h> (FILE*) alih-alih deskriptor int mentah - dalam kasus
-      itu perlu ditulis ulang pakai fopen("bu00:...", "r+b") dkk.
-   3. Kalau semua opsi gagal: set SAVE_FORCE_DISABLE 1 di bawah supaya game
-      tetap kompil dan jalan TANPA fitur save, sambil dicari solusi lebih
-      lanjut - ini lebih baik daripada build gagal total. */
+   PSn00bSDK belum punya library memory card tingkat-tinggi resmi yang
+   lengkap (dikonfirmasi dari dokumentasi resminya sendiri, per saat kode
+   ini ditulis). Baris-baris di bawah memanggil fungsi BIOS standar PS1
+   (InitCARD/StartCARD/_bu_init) dan fungsi file POSIX-style
+   (open/read/write/close) dengan path "bu00:...", sesuai dokumentasi
+   teknis BIOS PS1 (problemkaputt.de/psxspx).
+   SEMUA fungsi ini (InitCARD, StartCARD, _bu_init, open, close, read,
+   write) sudah tersedia lewat <psxapi.h> - JANGAN declare ulang manual
+   di sini, itu penyebab error "conflicting types" yang pernah terjadi.
+   Kalau CI masih gagal di baris-baris ini:
+   1. Cek nama & signature persis di <psxapi.h> SDK kamu - bisa beda
+      antar versi PSn00bSDK.
+   2. open/close bisa saja bentrok dgn libc: PSn00bSDK mungkin
+      menyediakan fungsi ini lewat <stdio.h> (FILE*) alih-alih
+      deskriptor int mentah - dalam kasus itu perlu ditulis ulang pakai
+      fopen("bu00:...", "r+b") dkk.
+   3. Kalau semua opsi gagal: set SAVE_FORCE_DISABLE 1 di bawah supaya
+      game tetap kompil dan jalan TANPA fitur save, sambil dicari solusi
+      lebih lanjut - ini lebih baik daripada build gagal total. */
 #define SAVE_FORCE_DISABLE 0
 
-#if !SAVE_FORCE_DISABLE
-extern int init_card(int pad_enable);
-extern void start_card(void);
-extern void _bu_init(void);
-extern int open(const char *name, int mode);
-extern int close(int fd);
-/* read() dan write() SUDAH dideklarasikan di <psxapi.h> dengan signature
-   size_t - JANGAN declare ulang di sini, akan bentrok (conflicting types). */
-#endif
+/* InitCARD, StartCARD, _bu_init, open, close, read, write SEMUA sudah
+   dideklarasikan di <psxapi.h> - tidak di-declare ulang manual di sini
+   supaya tidak ada risiko "conflicting types" kalau signature di SDK
+   berbeda dari yang diasumsikan. Kalau compiler bilang salah satu fungsi
+   ini implicit-declared / undefined reference, cek dulu isi <psxapi.h>
+   di SDK kamu (`find $HOME/psn00bsdk -name psxapi.h`) untuk signature
+   dan nama yang tepat. */
 
 /* mode file BIOS: 0x0002 = O_RDWR, bit9 (0x200) = "buat baru dgn ukuran",
    ukuran blok di-encode di bit16-31 (1 block = 0x1<<16) - lihat psx-spx */
@@ -112,9 +113,9 @@ static int cardReady = 0;
 
 static void ensureCardInit(void) {
     if (cardReady) return;
-    init_card(1);    // Menggunakan huruf kecil
-    start_card();   // Menggunakan huruf kecil
-    _bu_init();     // Tetap sama
+    InitCARD(1);
+    StartCARD();
+    _bu_init();
     cardReady = 1;
 }
 

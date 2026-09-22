@@ -48,8 +48,8 @@
 #define SAVE_FORCE_DISABLE 0
 
 #if !SAVE_FORCE_DISABLE
-extern int InitCard(int pad_enable);
-extern void StartCard(void);
+extern int init_card(int pad_enable);
+extern void start_card(void);
 extern void _bu_init(void);
 extern int open(const char *name, int mode);
 extern int close(int fd);

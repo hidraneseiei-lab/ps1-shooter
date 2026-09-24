@@ -31,6 +31,10 @@ typedef struct { int x, y, alive, type; } Item;
 typedef struct { int x, y, phase, timer, alive; } NovaBurst;
 /* [BARU] hazard ranjau, dipakai musuh Minelayer */
 typedef struct { int x, y, timer, alive; } Mine;
+/* [BARU v2] gelombang kejut melingkar milik E_VOIDCORE: radius membesar terus
+   dari pusat, beda dari NovaBurst (beam salib lurus) - ini cincin sungguhan,
+   tabrakan dicek berbasis jarak-dari-pusat, bukan beamHit. */
+typedef struct { int x, y, radius, alive; } VoidPulse;
 
 #define MAX_BULLETS    48
 #define MAX_EBULLETS   16
@@ -53,6 +57,17 @@ typedef struct { int x, y, timer, alive; } Mine;
 #define MINE_ARM_AT     130
 #define ABSORBER_CHARGE 5
 
+/* [BARU v2] konstanta 5 musuh level-puncak */
+#define MAX_VOIDPULSE     3
+#define SNIPER_WARN       50    /* frame laser Sniper berkedip sebelum tembak */
+#define SNIPER_COOLDOWN   90
+#define SWARMER_SPAWN_GAP 70    /* frame antar drone yang dimuntahkan Swarmer */
+#define VOIDCORE_PULSE_GAP 130  /* frame antar gelombang VoidCore */
+#define VOIDPULSE_GROWTH  2     /* piksel radius bertambah tiap frame */
+#define VOIDPULSE_MAX_R   90
+#define VOIDPULSE_RING_W  10    /* ketebalan cincin yang bisa melukai */
+#define TWIN_ENRAGE_SPEED 2     /* pengali kecepatan tembak saat pasangan mati */
+
 #define HUD_H   30
 #define TEXT_Y  12
 
@@ -67,7 +82,10 @@ enum { STATE_MENU, STATE_PLAY, STATE_GAMEOVER, STATE_GACHA, STATE_SKINSELECT };
 enum { E_DRONE = 0, E_ZIGZAG, E_TANK, E_SPINNER, E_SHOOTER, E_SPLITTER, E_SHIELDED,
        E_STINGER, E_ORBITER, E_PHANTOM, E_JUGGERNAUT, E_NOVA, E_SHARD, E_BOSS,
        /* [BARU] 6 musuh baru, ditaruh di akhir biar nilai enum lama tidak berubah */
-       E_TURRET, E_MINELAYER, E_CHARGER, E_MIRROR, E_HEALER, E_ABSORBER };
+       E_TURRET, E_MINELAYER, E_CHARGER, E_MIRROR, E_HEALER, E_ABSORBER,
+       /* [BARU v2] 5 musuh level-puncak (10+), lebih sulit secara MEKANIK
+          (bukan cuma HP lebih tebal): pola serangan baru yang belum ada. */
+       E_SNIPER, E_SWARMER, E_REFLECTOR, E_VOIDCORE, E_TWIN };
 enum { ITEM_HEAL = 0, ITEM_SHIELD = 1, ITEM_POWER = 2, ITEM_SPEED = 3 };
 
 /* ---------- [MAD] Boss rahasia ---------- */
@@ -96,11 +114,17 @@ typedef struct {
 typedef struct { int x, y, vx, vy, hp, alive; } Missile;
 typedef struct { int x, y, timer, alive; } Bomb;
 typedef struct { int x, y, angle, timer, alive; } MLaser;
+/* [BARU v2] beam milik E_SNIPER, terpisah dari MLaser (yang eksklusif boss,
+   slotnya cuma 3 dan dipakai penuh sekaligus untuk pola salib). Struktur mirip
+   tapi array sendiri supaya banyak Sniper aktif tidak berebut slot dgn boss. */
+typedef struct { int x, y, angle, timer, alive; } SniperBeam;
 
 static MadBoss  mad;
 static Missile  missiles[MAX_MISSILES];
 static Bomb     mbombs[MAX_BOMBS];
 static MLaser   mlasers[MAX_MLASERS];
+#define MAX_SNIPERBEAM 4
+static SniperBeam sniperBeams[MAX_SNIPERBEAM];   /* [BARU v2] */
 static int      madSpawned = 0;
 static int      konami = 0;
 static int      forceMad = 0;
@@ -129,6 +153,7 @@ static Star      stars[NUM_STARS];
 static Item      items[MAX_ITEMS];
 static NovaBurst novabursts[MAX_NOVABURST];
 static Mine      mines[MAX_MINES];   /* [BARU] */
+static VoidPulse voidpulses[MAX_VOIDPULSE];   /* [BARU v2] */
 
 static int shootX = -100, shootY = 0, shootT = 0;
 
@@ -1006,6 +1031,123 @@ static void drawAbsorber(const Enemy *e, int frame) {
     discLo(L_ENEMY, cx, cy, 3, 255, 255, 255, 200, 160, 255);
 }
 
+/* [BARU v2] E_SNIPER: diam, mengunci lama, lalu tembak beam lurus presisi.
+   Mata merah membesar & berkedip cepat saat warning (e->timer < SNIPER_WARN). */
+static void drawSniper(const Enemy *e, int frame) {
+    int x = e->x, y = e->y, cx = x + 12, cy = y + 12;
+    int locking = (e->timer > 0 && e->timer < SNIPER_WARN);
+    rect(L_ENEMY, x + 2, y + 14, 20, 10, 50, 50, 60);
+    tri(L_ENEMY, x, y + 24, 30, 30, 40, x + 24, y + 24, 30, 30, 40, cx, y + 10, 70, 70, 85);
+    int blink = locking ? ((frame & 1) ? 255 : 60) : 180;
+    int eyeR = locking ? 7 + (frame % 4) : 4;
+    glowDisc(cx, cy - 2, eyeR + 4, blink, 20, 20, 8);
+    disc(L_ENEMY, cx, cy - 2, eyeR, blink, 20, 20, blink / 3, 5, 5);
+    rect(L_ENEMY, x - 2, y + 18, 3, 6, 60, 60, 70);
+    rect(L_ENEMY, x + 23, y + 18, 3, 6, 60, 60, 70);
+}
+
+/* [BARU v2] E_SWARMER: sarang organik diam yang terus memuntahkan drone kecil
+   cepat selama hidup - tekanan datang dari JUMLAH, bukan tembakan individual. */
+static void drawSwarmer(const Enemy *e, int frame) {
+    int cx = e->x + 13, cy = e->y + 13;
+    int pulse = sinS(frame * 2) / 20;
+    glowDisc(cx, cy, 14 + pulse, 140, 255, 90, 8);
+    for (int i = 0; i < 16; i += 2) {
+        int x1 = cx + cosI(i)     * (12 + pulse) / 127, y1 = cy + sinI(i)     * (12 + pulse) / 127;
+        int x2 = cx + cosI(i + 2) * (12 + pulse) / 127, y2 = cy + sinI(i + 2) * (12 + pulse) / 127;
+        tri(L_ENEMY, cx, cy, 40, 90, 30, x1, y1, 100, 200, 70, x2, y2, 100, 200, 70);
+    }
+    int holeGlow = (e->timer < 10) ? 255 : 120;
+    disc(L_ENEMY, cx, cy, 6, holeGlow, 255, holeGlow / 2, 20, 60, 15);
+}
+
+/* [BARU v2] E_REFLECTOR: kristal berputar dengan perisai HANYA di satu sisi
+   (sisi terang = terlindungi, sisi gelap = rentan). Pemain harus memutari
+   posisi tembak, bukan sekadar spam peluru dari depan. */
+static void drawReflector(const Enemy *e, int frame) {
+    int cx = e->x + 10, cy = e->y + 10;
+    int rot = (e->t * 2) & 15;   /* arah perisai berputar pelan seiring waktu hidup */
+    for (int i = 0; i < 16; i += 2) {
+        /* [FIX] shielded HARUS dicek dari i (posisi relatif SEBELUM rotasi),
+           bukan dari a (posisi absolut SESUDAH rotasi) - versi lama salah,
+           bikin sisi terang keliatan statis walau rot berubah (dibuktikan
+           lewat simulasi terpisah: rot=0 dan rot=4 menghasilkan sisi terang
+           yang identik, padahal harusnya ikut berputar). */
+        int shielded = (i < 8);  /* setengah lingkaran TETAP relatif rotasi = terlindungi */
+        int a = (i + rot) & 15;
+        int x1 = cx + cosI(a)     * 11 / 127, y1 = cy + sinI(a)     * 11 / 127;
+        int x2 = cx + cosI(a + 2) * 11 / 127, y2 = cy + sinI(a + 2) * 11 / 127;
+        if (shielded)
+            tri(L_ENEMY, cx, cy, 200, 220, 255, x1, y1, 120, 180, 255, x2, y2, 120, 180, 255);
+        else
+            tri(L_ENEMY, cx, cy, 60, 30, 70, x1, y1, 30, 10, 40, x2, y2, 30, 10, 40);
+    }
+    discLo(L_ENEMY, cx, cy, 3, 255, 255, 255, 200, 220, 255);
+    /* penanda kecil di sisi rentan supaya pemain bisa baca pola */
+    int markA = (rot + 12) & 15;
+    int mx = cx + cosI(markA) * 9 / 127, my = cy + sinI(markA) * 9 / 127;
+    rect(L_ENEMY, mx - 1, my - 1, 2, 2, 255, 80, 80);
+}
+
+/* [BARU v2] E_VOIDCORE: inti diam yang melepas gelombang kejut MELINGKAR
+   (bukan beam lurus seperti Nova) secara berkala, radius terus membesar. */
+static void drawVoidcore(const Enemy *e, int frame) {
+    int cx = e->x + 12, cy = e->y + 12;
+    int chargeT = VOIDCORE_PULSE_GAP - e->timer;
+    int pulse = (chargeT > VOIDCORE_PULSE_GAP - 20) ? (chargeT - (VOIDCORE_PULSE_GAP - 20)) : 0;
+    glowDisc(cx, cy, 10 + pulse, 150, 60, 220, 8);
+    disc(L_ENEMY, cx, cy, 9, 40, 10, 60, 90, 20, 140);
+    /* partikel tersedot masuk ke inti - kesan "menyerap energi" sebelum meledak */
+    int rot = (frame * 3) & 63;
+    for (int i = 0; i < 4; i++) {
+        int a = (rot + i * 16) & 63;
+        int dist = 16 - ((frame + i * 8) % 16);
+        int px = cx + cosO(a) * dist / 127, py = cy + sinO(a) * dist / 127;
+        rect(L_ENEMY, px - 1, py - 1, 2, 2, 200, 140, 255);
+    }
+    discLo(L_ENEMY, cx, cy, 3, 255, 255, 255, 180, 100, 255);
+}
+
+/* [BARU v2] E_TWIN: musuh berpasangan terhubung tali energi. e->buff menyimpan
+   indeks pasangan di array enemies[]. Kalau pasangan mati, sisanya "enrage"
+   (ditandai warna lebih merah & berkedip cepat, kecepatan ditangani di update). */
+static void drawTwin(const Enemy *e, int frame) {
+    int cx = e->x + 9, cy = e->y + 9;
+    int enraged = (e->vx == 1);   /* vx dipakai sbg flag enrage (1 = pasangan sudah mati) */
+    int r = enraged ? 255 : 160, g = enraged ? 60 : 140, b = enraged ? 60 : 255;
+    int flick = enraged ? ((frame & 2) ? 255 : 150) : 200;
+    glowDisc(cx, cy, 8, r, g, b, 8);
+    tri(L_ENEMY, cx, cy - 8, flick, flick, 255, cx - 7, cy + 6, r / 2, g / 2, b / 2, cx + 7, cy + 6, r / 2, g / 2, b / 2);
+    discLo(L_ENEMY, cx, cy, 3, 255, 255, 255, r, g, b);
+}
+
+/* [BARU v2] gambar tali energi antar Twin (dipanggil terpisah dari loop utama
+   karena butuh akses ke DUA enemy sekaligus - lihat pemanggilan di render). */
+static void drawTwinLink(int x1, int y1, int x2, int y2, int frame) {
+    int mx = (x1 + y1) & 1;   /* variasi kecil biar tidak statis-kaku */
+    int flick = (frame & 4) ? 180 : 100;
+    int steps = 6;
+    for (int i = 0; i < steps; i++) {
+        int ax = x1 + (x2 - x1) * i / steps, ay = y1 + (y2 - y1) * i / steps;
+        int bx = x1 + (x2 - x1) * (i + 1) / steps, by = y1 + (y2 - y1) * (i + 1) / steps;
+        int wob = (mx + i + frame / 3) % 2 ? 1 : -1;
+        rect(L_FX, (ax + bx) / 2, (ay + by) / 2 + wob, 2, 1, flick, flick / 3, flick / 2);
+    }
+}
+
+/* [BARU v2] gambar cincin gelombang kejut VoidPulse: MELINGKAR, bukan salib
+   lurus seperti Nova - beda mekanik & visual dari sistem hazard yang sudah ada. */
+static void drawVoidPulse(const VoidPulse *v) {
+    int fadeOut = v->radius > VOIDPULSE_MAX_R - 20 ? (VOIDPULSE_MAX_R - v->radius) * 255 / 20 : 255;
+    if (fadeOut < 0) fadeOut = 0;
+    for (int i = 0; i < 32; i++) {
+        int a1 = i * 2, a2 = i * 2 + 2;
+        int x1 = v->x + cosO(a1) * v->radius / 127, y1 = v->y + sinO(a1) * v->radius / 127;
+        int x2 = v->x + cosO(a2) * v->radius / 127, y2 = v->y + sinO(a2) * v->radius / 127;
+        rect(L_FX, (x1 + x2) / 2 - 1, (y1 + y2) / 2 - 1, 2, 2, 180 * fadeOut / 255, 60 * fadeOut / 255, 220 * fadeOut / 255);
+    }
+}
+
 static void drawMine(const Mine *m, int frame) {
     int armed = m->timer < MINE_ARM_AT;
     int blinkRate = armed ? 4 : 10;
@@ -1036,6 +1178,11 @@ static void drawEnemy(const Enemy *e, int frame) {
     case E_MIRROR:     drawMirror(e, frame);     break;
     case E_HEALER:     drawHealer(e, frame);     break;
     case E_ABSORBER:   drawAbsorber(e, frame);   break;
+    case E_SNIPER:     drawSniper(e, frame);     break;
+    case E_SWARMER:    drawSwarmer(e, frame);    break;
+    case E_REFLECTOR:  drawReflector(e, frame);  break;
+    case E_VOIDCORE:   drawVoidcore(e, frame);   break;
+    case E_TWIN:       drawTwin(e, frame);       break;
     case E_BOSS: {
         int bx = e->x, by = e->y;
         int glow = 160 + ((frame / 3) & 1) * 90;
@@ -1198,6 +1345,45 @@ static void spawnShards(int x, int y) {
     }
 }
 
+/* [BARU v2] E_SWARMER memuntahkan 1 E_DRONE cepat tiap SWARMER_SPAWN_GAP frame
+   selama masih hidup - drone yang dipakai adalah tipe yang sudah ada (tidak
+   menambah tipe musuh baru lagi), supaya tekanannya murni dari JUMLAH. */
+static void spawnSwarmDrone(int x, int y) {
+    for (int k = 0; k < MAX_ENEMIES; k++) {
+        if (enemies[k].alive) continue;
+        enemies[k].type = E_DRONE;
+        enemies[k].x = x; enemies[k].y = y;
+        enemies[k].hp = 1; enemies[k].t = rand() % 16;
+        enemies[k].shield = 0; enemies[k].timer = 0;
+        enemies[k].vx = 0; enemies[k].vy = 0; enemies[k].tx = 0; enemies[k].ty = 0; enemies[k].buff = 0;
+        enemies[k].alive = 1;
+        return;
+    }
+}
+
+/* [BARU v2] E_TWIN selalu muncul berpasangan (BUKAN lewat pickEnemyType acak
+   biasa - lihat komentar di pickEnemyType). e->buff tiap unit menyimpan
+   indeks pasangannya di array enemies[], dicek tiap frame di loop update
+   untuk menentukan status enrage. Gagal diam-diam kalau slot kurang dari 2. */
+static void spawnTwinPair(int level) {
+    int slot[2] = { -1, -1 }, found = 0;
+    for (int k = 0; k < MAX_ENEMIES && found < 2; k++)
+        if (!enemies[k].alive) slot[found++] = k;
+    if (found < 2) return;   /* tidak cukup slot, lewati kali ini */
+
+    int baseX = 40 + rand() % (SCREEN_W - 120);
+    for (int i = 0; i < 2; i++) {
+        Enemy *e = &enemies[slot[i]];
+        e->type = E_TWIN;
+        e->x = baseX + i * 60; e->y = HUD_H + 2;
+        e->hp = 2 + (level >= 10 ? 1 : 0);
+        e->t = rand() % 16; e->shield = 0; e->timer = 0;
+        e->vx = 0; e->vy = 0; e->tx = 0; e->ty = 0;
+        e->buff = slot[1 - i];   /* index pasangan (silang: 0->1, 1->0) */
+        e->alive = 1;
+    }
+}
+
 /* [BARU] fungsi bantu 6 musuh baru */
 
 static void spawnMine(int x, int y) {
@@ -1206,6 +1392,17 @@ static void spawnMine(int x, int y) {
         mines[i].x = x; mines[i].y = y;
         mines[i].timer = MINE_LIFE;
         mines[i].alive = 1;
+        return;
+    }
+}
+
+/* [BARU v2] gelombang kejut melingkar milik E_VOIDCORE */
+static void spawnVoidPulse(int x, int y) {
+    for (int i = 0; i < MAX_VOIDPULSE; i++) {
+        if (voidpulses[i].alive) continue;
+        voidpulses[i].x = x; voidpulses[i].y = y;
+        voidpulses[i].radius = 0;
+        voidpulses[i].alive = 1;
         return;
     }
 }
@@ -1375,6 +1572,11 @@ static void enemySize(const Enemy *e, int *w, int *h) {
     case E_MIRROR:     *w = 16; *h = 16; break;
     case E_HEALER:     *w = 18; *h = 18; break;
     case E_ABSORBER:   *w = 22; *h = 22; break;
+    case E_SNIPER:     *w = 24; *h = 24; break;
+    case E_SWARMER:    *w = 26; *h = 26; break;
+    case E_REFLECTOR:  *w = 20; *h = 20; break;
+    case E_VOIDCORE:   *w = 24; *h = 24; break;
+    case E_TWIN:       *w = 18; *h = 18; break;
     default:           *w = 16; *h = 18; break;
     }
 }
@@ -1407,6 +1609,20 @@ static int nearestPlayer(int x, int y) {
         if (d < bestD) { bestD = d; best = p; }
     }
     return best;
+}
+
+/* [BARU v2] cari sudut diskrit (0..15, skala sinI/cosI) yang paling dekat
+   mengarah dari (fromX,fromY) ke (toX,toY). Dipakai E_SNIPER supaya beamQuad/
+   beamHit (yang cuma menerima sudut 16-segmen) bisa "mengunci" ke arah pemain
+   alih-alih cuma 4-8 arah tetap seperti MLaser boss. */
+static int angleToTarget(int fromX, int fromY, int toX, int toY) {
+    int dx = toX - fromX, dy = toY - fromY;
+    int bestAng = 0, bestDot = -0x7fffffff;
+    for (int a = 0; a < 16; a++) {
+        int dot = dx * cosI(a) + dy * sinI(a);   /* proyeksi: makin besar makin searah */
+        if (dot > bestDot) { bestDot = dot; bestAng = a; }
+    }
+    return bestAng;
 }
 
 static void placePlayer(int p) {
@@ -1447,6 +1663,8 @@ static void clearWorld(void) {
     for (int i = 0; i < MAX_ITEMS; i++)      items[i].alive = 0;
     for (int i = 0; i < MAX_NOVABURST; i++)  novabursts[i].alive = 0;
     for (int i = 0; i < MAX_MINES; i++)      mines[i].alive = 0;   /* [BARU] */
+    for (int i = 0; i < MAX_SNIPERBEAM; i++) sniperBeams[i].alive = 0;   /* [BARU v2] */
+    for (int i = 0; i < MAX_VOIDPULSE; i++)  voidpulses[i].alive = 0;    /* [BARU v2] */
     madReset();
 }
 
@@ -1462,6 +1680,13 @@ static int pickEnemyType(int level) {
     if (level >= 7) { pool[n++] = E_SPLITTER; pool[n++] = E_JUGGERNAUT; pool[n++] = E_CHARGER; }
     if (level >= 8) { pool[n++] = E_SHIELDED; pool[n++] = E_NOVA;       pool[n++] = E_MIRROR; }
     if (level >= 9) { pool[n++] = E_HEALER;   pool[n++] = E_ABSORBER;  }
+    /* [BARU v2] level puncak: 5 musuh baru yang lebih sulit secara mekanik.
+       Sengaja HANYA muncul di level 10 (bukan dicampur lebih awal) supaya
+       terasa sebagai tantangan akhir yang jelas, bukan tercampur biasa. */
+    if (level >= 10) { pool[n++] = E_SNIPER; pool[n++] = E_SWARMER; pool[n++] = E_REFLECTOR;
+                        pool[n++] = E_VOIDCORE; }
+    /* E_TWIN sengaja TIDAK masuk pool acak biasa - selalu di-spawn berpasangan
+       lewat fungsi khusus (lihat spawnTwinPair), bukan lewat pickEnemyType. */
     return pool[rand() % n];
 }
 
@@ -1565,6 +1790,21 @@ static void spawnMLaser(int x, int y, int angle) {
         mlasers[i].angle = angle;
         mlasers[i].timer = MLASER_WARN + MLASER_FIRE;
         mlasers[i].alive = 1;
+        sfxPlay(SND_LASER);
+        return;
+    }
+}
+
+/* [BARU v2] beam milik E_SNIPER. Lebih pendek durasinya dari MLaser boss
+   (SNIPER lebih sering nembak tapi tiap tembakan lebih singkat & presisi). */
+#define SNIPERBEAM_FIRE 45
+static void spawnSniperBeam(int x, int y, int angle) {
+    for (int i = 0; i < MAX_SNIPERBEAM; i++) {
+        if (sniperBeams[i].alive) continue;
+        sniperBeams[i].x = x; sniperBeams[i].y = y;
+        sniperBeams[i].angle = angle;
+        sniperBeams[i].timer = SNIPERBEAM_FIRE;
+        sniperBeams[i].alive = 1;
         sfxPlay(SND_LASER);
         return;
     }
@@ -1820,6 +2060,14 @@ int main(void) {
 
             int spawnEvery = 42 - level * 3 - (nPlayers - 1) * 3;
             if (spawnEvery < 10) spawnEvery = 10;
+
+            /* [BARU v2] E_TWIN dipicu terpisah dari pool acak biasa - selalu
+               berpasangan, hanya di level 10, interval lebih jarang dari
+               spawn musuh biasa (Twin butuh 2 slot & butuh dibunuh berurutan). */
+            if (!bossOn && !madBusy && level >= 10 && frame % (spawnEvery * 3) == 0 &&
+                countEnemies() < enemyCap - 2)
+                spawnTwinPair(level);
+
             if (!bossOn && !madBusy && frame % spawnEvery == 0 && countEnemies() < enemyCap) {
                 for (int i = 0; i < MAX_ENEMIES; i++) {
                     if (enemies[i].alive) continue;
@@ -1847,6 +2095,13 @@ int main(void) {
                         case E_MIRROR:     e->hp = 3;  e->shield = 0; e->timer = 0;   e->vx = (rand() & 1) ? 1 : -1; break;
                         case E_HEALER:     e->hp = 4;  e->shield = 0; e->timer = 100; e->vx = (rand() & 1) ? 1 : -1; break;
                         case E_ABSORBER:   e->hp = 10; e->shield = 0; e->timer = 0;   e->vx = 0; break;
+                        /* [BARU v2] 5 musuh level-puncak. HP sengaja rendah-sedang
+                           (bukan tank) karena kesulitan datang dari POLA SERANGAN,
+                           bukan dari lama ditembak - filosofi beda dari Juggernaut/Absorber. */
+                        case E_SNIPER:     e->hp = 2; e->shield = 0; e->timer = SNIPER_COOLDOWN; e->vx = 0; break;
+                        case E_SWARMER:    e->hp = 6; e->shield = 0; e->timer = SWARMER_SPAWN_GAP; break;
+                        case E_REFLECTOR:  e->hp = 2; e->shield = 0; e->timer = 0; break;
+                        case E_VOIDCORE:   e->hp = 5; e->shield = 0; e->timer = VOIDCORE_PULSE_GAP; break;
                         default:           e->hp = 1; e->shield = 0; e->timer = 0;  break;
                     }
                     if (e->type != E_SHARD && nPlayers > 1) e->hp += (nPlayers - 1) / 2;
@@ -2065,6 +2320,64 @@ int main(void) {
                     if (e->y < HUD_H + 30) e->y += 1;
                     break;
 
+                /* [BARU v2] E_SNIPER: masuk pelan, lalu diam & mengunci sudut
+                   presisi ke pemain sebelum tembak beam singkat. */
+                case E_SNIPER:
+                    if (e->y < HUD_H + 36) { e->y += 1; break; }
+                    if (e->timer > SNIPER_WARN) {
+                        e->timer--;
+                    } else if (e->timer > 0) {
+                        e->t = angleToTarget(e->x + 12, e->y + 12, tx + 8, ty + 8);   /* kunci terus tiap frame warning */
+                        e->timer--;
+                        if (e->timer == 0) {
+                            spawnSniperBeam(e->x + 12, e->y + 12, e->t);
+                            e->timer = SNIPER_COOLDOWN;
+                        }
+                    }
+                    break;
+
+                /* [BARU v2] E_SWARMER: diam total, terus memuntahkan E_DRONE
+                   selama masih hidup - berhenti otomatis kalau enemies penuh
+                   (spawnSwarmDrone diam-diam gagal kalau tidak ada slot). */
+                case E_SWARMER:
+                    if (e->y < HUD_H + 24) { e->y += 1; break; }
+                    if (--e->timer <= 0) {
+                        spawnSwarmDrone(e->x + 3, e->y + 26);
+                        e->timer = SWARMER_SPAWN_GAP;
+                    }
+                    break;
+
+                /* [BARU v2] E_REFLECTOR: melayang turun sangat pelan, rotasi
+                   perisai otomatis lewat e->t (sudah di-increment di awal loop
+                   untuk SEMUA musuh, lihat "e->t++;" di atas). */
+                case E_REFLECTOR:
+                    if (e->y < SCREEN_H - 60) e->y += 1;
+                    e->x += sinS(e->t) / 48;
+                    break;
+
+                /* [BARU v2] E_VOIDCORE: diam total, lepas VoidPulse berkala. */
+                case E_VOIDCORE:
+                    if (e->y < HUD_H + 40) { e->y += 1; break; }
+                    if (--e->timer <= 0) {
+                        spawnVoidPulse(e->x + 12, e->y + 12);
+                        e->timer = VOIDCORE_PULSE_GAP;
+                    }
+                    break;
+
+                /* [BARU v2] E_TWIN: bergerak turun pelan berpasangan. Kalau
+                   pasangan (indeks di e->buff) sudah mati, unit ini "enrage":
+                   vx dipakai sbg flag (1 = enrage) dan gerak jadi 2x lebih
+                   cepat + oscillasi horizontal lebih liar. */
+                case E_TWIN: {
+                    int partnerAlive = (e->buff >= 0 && e->buff < MAX_ENEMIES &&
+                                         enemies[e->buff].alive && enemies[e->buff].type == E_TWIN);
+                    if (!partnerAlive) e->vx = 1;   /* enrage permanen setelah pasangan mati */
+                    int spd = e->vx ? TWIN_ENRAGE_SPEED : 1;
+                    e->y += spd;
+                    e->x += (sinS(e->t * (e->vx ? 3 : 1)) / (e->vx ? 24 : 40));
+                    break;
+                }
+
                 default:
                     e->y += baseSpeed;
                     break;
@@ -2083,11 +2396,33 @@ int main(void) {
                         continue;
                     }
 
-                    /* [BARU] lapisan buff dari Healer, berlaku universal, dicek sebelum shield asli */
-                    if (e->buff > 0) {
+                    /* [BARU] lapisan buff dari Healer, berlaku universal, dicek sebelum shield asli.
+                       [FIX KRITIS v2] E_TWIN memakai field `buff` untuk INDEKS PASANGAN (0..23),
+                       bukan counter perisai - tanpa pengecualian ini, Twin yang pasangannya
+                       kebetulan berindeks > 0 akan salah dianggap "terlindungi Healer" dan
+                       menyerap peluru tanpa rusak sama sekali. */
+                    if (e->type != E_TWIN && e->buff > 0) {
                         e->buff--;
                         spawnSparks(bullets[j].x + 2, bullets[j].y, 4, 140, 255, 180, 0);
                         continue;
+                    }
+
+                    /* [BARU v2] E_REFLECTOR: peluru dari sisi TERLINDUNGI (setengah
+                       lingkaran searah rotasi e->t, sama seperti logika drawReflector)
+                       dipantulkan/diserap tanpa damage. Sisi rentan (belakang) tetap
+                       bisa ditembak normal - memaksa pemain memposisikan tembakan. */
+                    if (e->type == E_REFLECTOR) {
+                        int cx = e->x + 10, cy = e->y + 10;
+                        int dx = bullets[j].x - cx, dy = bullets[j].y - cy;
+                        int rot = (e->t * 2) & 15;
+                        /* sudut datang peluru relatif pusat -> cari sudut diskrit terdekat,
+                           lalu cek apakah masuk rentang shielded (sama seperti drawReflector) */
+                        int bulletAng = angleToTarget(cx, cy, cx + dx, cy + dy);
+                        int rel = (bulletAng - rot) & 15;
+                        if (rel < 8) {   /* sisi terlindungi: tolak peluru */
+                            spawnSparks(bullets[j].x + 2, bullets[j].y, 3, 150, 200, 255, 0);
+                            continue;
+                        }
                     }
 
                     /* [FIX] Charger & Mirror numpang field `shield` untuk hal LAIN (state/flag),
@@ -2132,6 +2467,8 @@ int main(void) {
 
                         int pts = 1;
                         if (e->type == E_BOSS) pts = 10;
+                        else if (e->type == E_SNIPER || e->type == E_VOIDCORE) pts = 5;   /* [BARU v2] */
+                        else if (e->type == E_SWARMER || e->type == E_REFLECTOR || e->type == E_TWIN) pts = 4;   /* [BARU v2] */
                         else if (e->type == E_ABSORBER || e->type == E_JUGGERNAUT) pts = 4;
                         else if (e->type == E_TANK || e->type == E_SHIELDED || e->type == E_NOVA || e->type == E_HEALER) pts = 3;
                         else if (e->type == E_TURRET || e->type == E_MINELAYER || e->type == E_CHARGER) pts = 2;
@@ -2369,6 +2706,40 @@ int main(void) {
                 }
             }
 
+            /* [BARU v2] beam E_SNIPER: aktif penuh sejak ditembak (peringatan
+               sudah terjadi lewat visual mata berkedip sebelum ini dipanggil).
+               Lebih tipis dari MLaser boss (halfThick 4 vs 7) - presisi tinggi
+               tapi bisa dihindari dengan gerak kecil di saat tepat. */
+            for (int i = 0; i < MAX_SNIPERBEAM; i++) {
+                if (!sniperBeams[i].alive) continue;
+                if (--sniperBeams[i].timer <= 0) { sniperBeams[i].alive = 0; continue; }
+                for (int p = 0; p < MAX_PLAYERS; p++) {
+                    Player *pl = &players[p];
+                    if (!pl->active || !pl->alive || pl->invuln > 0 || pl->shieldStack > 0) continue;
+                    if (beamHit(sniperBeams[i].x, sniperBeams[i].y, sniperBeams[i].angle, 260, 4, pl->x + 8, pl->y + 8))
+                        hurtPlayer(p);
+                }
+            }
+
+            /* [BARU v2] VoidPulse: cincin membesar terus, melukai HANYA saat
+               pemain berada tepat di lingkar cincin (jarak dlm VOIDPULSE_RING_W
+               dari radius saat ini) - beda dari area solid, jadi bisa dihindari
+               dengan masuk KE DALAM cincin sebelum kena, bukan cuma lari keluar. */
+            for (int i = 0; i < MAX_VOIDPULSE; i++) {
+                if (!voidpulses[i].alive) continue;
+                voidpulses[i].radius += VOIDPULSE_GROWTH;
+                if (voidpulses[i].radius > VOIDPULSE_MAX_R) { voidpulses[i].alive = 0; continue; }
+                for (int p = 0; p < MAX_PLAYERS; p++) {
+                    Player *pl = &players[p];
+                    if (!pl->active || !pl->alive || pl->invuln > 0 || pl->shieldStack > 0) continue;
+                    int dx = pl->x + 8 - voidpulses[i].x, dy = pl->y + 8 - voidpulses[i].y;
+                    int dist2 = dx * dx + dy * dy;
+                    int rIn = voidpulses[i].radius - VOIDPULSE_RING_W, rOut = voidpulses[i].radius + VOIDPULSE_RING_W;
+                    if (rIn < 0) rIn = 0;
+                    if (dist2 >= rIn * rIn && dist2 <= rOut * rOut) hurtPlayer(p);
+                }
+            }
+
             for (int i = 0; i < MAX_EBULLETS; i++) {
                 if (!ebullets[i].alive) continue;
                 for (int p = 0; p < MAX_PLAYERS; p++) {
@@ -2461,6 +2832,18 @@ int main(void) {
         } else if (state == STATE_SKINSELECT) {
             drawSkinSelectScreen(frame);
         } else {
+            /* [BARU v2] tali energi antar pasangan E_TWIN, digambar SEBELUM
+               drawEnemy supaya tali tampak di belakang pesawat, bukan menimpa.
+               Cek i < e->buff supaya tiap pasangan cuma digambar sekali. */
+            for (int i = 0; i < MAX_ENEMIES; i++) {
+                const Enemy *e = &enemies[i];
+                if (!e->alive || e->type != E_TWIN) continue;
+                if (e->buff <= i || e->buff >= MAX_ENEMIES) continue;
+                const Enemy *partner = &enemies[e->buff];
+                if (!partner->alive || partner->type != E_TWIN) continue;
+                drawTwinLink(e->x + 9, e->y + 9, partner->x + 9, partner->y + 9, frame);
+            }
+
             for (int i = 0; i < MAX_ENEMIES; i++)
                 if (enemies[i].alive) drawEnemy(&enemies[i], frame);
 
@@ -2522,6 +2905,21 @@ int main(void) {
                     beamQuad(L_FX, mlasers[i].x, mlasers[i].y, mlasers[i].angle, 260, 5,  255, 255, 255, 0);
                 }
             }
+
+            /* [BARU v2] gambar beam E_SNIPER: tipis & tajam, kedip di akhir durasi
+               sebagai tanda mau hilang (bantu pemain baca timing). */
+            for (int i = 0; i < MAX_SNIPERBEAM; i++) {
+                if (!sniperBeams[i].alive) continue;
+                int fading = sniperBeams[i].timer < 10;
+                if (!fading || (frame & 1)) {
+                    beamQuad(L_FX, sniperBeams[i].x, sniperBeams[i].y, sniperBeams[i].angle, 260, 6, 255, 60, 60, 0);
+                    beamQuad(L_FX, sniperBeams[i].x, sniperBeams[i].y, sniperBeams[i].angle, 260, 2, 255, 220, 220, 0);
+                }
+            }
+
+            /* [BARU v2] gambar cincin VoidPulse */
+            for (int i = 0; i < MAX_VOIDPULSE; i++)
+                if (voidpulses[i].alive) drawVoidPulse(&voidpulses[i]);
 
             if (state == STATE_PLAY) {
                 for (int p = 0; p < MAX_PLAYERS; p++) {

@@ -6,7 +6,11 @@ Space shooter untuk PlayStation 1, dibuat dengan PSn00bSDK.
 
 ## Fitur
 - Hingga 4 pemain lokal (multitap)
-- 19 tipe musuh + 2 boss (termasuk boss rahasia "Mad Cruiser")
+- 24 tipe musuh + 2 boss (termasuk boss rahasia "Mad Cruiser")
+  - 5 musuh level-puncak (muncul mulai level 10): Sniper (beam presisi terkunci),
+    Swarmer (memuntahkan drone terus-menerus), Reflector (perisai arah berputar,
+    hanya bisa ditembak dari sisi rentan), VoidCore (gelombang kejut melingkar
+    membesar), Twin (musuh berpasangan yang enrage saat pasangannya mati)
 - Sistem gacha untuk membuka skin pesawat
 - Musik dan efek suara prosedural (SPU-ADPCM)
 - Efek layar: screen shake, flash, fade transisi

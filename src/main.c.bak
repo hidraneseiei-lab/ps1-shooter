@@ -1,0 +1,178 @@
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <ctype.h>
+#include "../include/value.h"
+#include "../include/lexer.h"
+#include "../include/parser.h"
+#include "../include/interpreter.h"
+#include "../include/builtin.h"
+
+/* ===== main.c =====
+   Entry point: baca file .nv (atau mode REPL interaktif kalau tidak
+   ada argumen), proses 'Impor' (gabung semua modul jadi satu token
+   stream sebelum tokenize -- lihat preprocessImports), lalu run(). */
+
+typedef struct { char** items; int count; int cap; } StrList;
+void strListInit(StrList* l){ l->cap=8; l->items=malloc(sizeof(char*)*l->cap); l->count=0; }
+int strListContains(StrList* l, const char* s){ for(int i=0;i<l->count;i++) if(strcmp(l->items[i],s)==0) return 1; return 0; }
+void strListAdd(StrList* l, const char* s){ if(l->count>=l->cap){l->cap*=2; l->items=realloc(l->items,sizeof(char*)*l->cap);} l->items[l->count++]=strdup(s); }
+
+char* readWholeFile(const char* path) {
+    FILE* f = fopen(path, "r");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char* buf = malloc(sz+1);
+    size_t rd = fread(buf,1,sz,f);
+    buf[rd]=0;
+    fclose(f);
+    return buf;
+}
+
+char* preprocessImports(const char* src, StrList* included) {
+    size_t cap = strlen(src)*2 + 256;
+    char* out = malloc(cap);
+    size_t outLen = 0;
+    int len = strlen(src);
+    int i = 0;
+    int inString = 0;
+    while (i < len) {
+        if (!inString && src[i]=='/' && i+1<len && src[i+1]=='/') {
+            while (i<len && src[i] != '\n') {
+                if (outLen+1>=cap){cap*=2; out=realloc(out,cap);} out[outLen++]=src[i]; i++;
+            }
+            continue;
+        }
+        if (src[i]=='"') {
+            inString = !inString;
+            if (outLen+1>=cap){cap*=2; out=realloc(out,cap);} out[outLen++]=src[i]; i++;
+            continue;
+        }
+        if (!inString && isalpha((unsigned char)src[i])) {
+            int start=i;
+            int j=i;
+            while (j<len && (isalnum((unsigned char)src[j])||src[j]=='_')) j++;
+            int wlen = j-start;
+            if (wlen==5 && strncmp(src+start,"Impor",5)==0) {
+                int k=j;
+                while (k<len && isspace((unsigned char)src[k])) k++;
+                if (k<len && src[k]=='"') {
+                    k++;
+                    int fstart=k;
+                    while (k<len && src[k] != '"') k++;
+                    int flen = k-fstart;
+                    char* fname = malloc(flen+1);
+                    strncpy(fname, src+fstart, flen);
+                    fname[flen]=0;
+                    if (k<len) k++;
+                    while (k<len && isspace((unsigned char)src[k])) k++;
+                    if (k<len && src[k]==';') k++;
+                    if (!strListContains(included, fname)) {
+                        strListAdd(included, fname);
+                        char* fileContent = readWholeFile(fname);
+                        if (!fileContent) {
+                            fprintf(stderr, "*** ERROR: tidak bisa impor file '%s' ***\n", fname);
+                            exit(1);
+                        }
+                        char* processedInner = preprocessImports(fileContent, included);
+                        free(fileContent);
+                        size_t ilen = strlen(processedInner);
+                        while (outLen+ilen+2 >= cap) { cap*=2; out=realloc(out,cap); }
+                        memcpy(out+outLen, processedInner, ilen);
+                        outLen += ilen;
+                        out[outLen++]='\n';
+                        free(processedInner);
+                    }
+                    free(fname);
+                    i = k;
+                    continue;
+                }
+            }
+            while (outLen+wlen>=cap){cap*=2; out=realloc(out,cap);}
+            memcpy(out+outLen, src+start, wlen);
+            outLen += wlen;
+            i = j;
+            continue;
+        }
+        if (outLen+1>=cap){cap*=2; out=realloc(out,cap);}
+        out[outLen++] = src[i];
+        i++;
+    }
+    out[outLen]=0;
+    return out;
+}
+
+int main(int argc, char** argv) {
+    srand((unsigned int)time(NULL));
+    initScopes();
+    return_value = makeNumber(0);
+
+    if (argc >= 2) {
+        g_argc = argc - 2;
+        g_argv = (g_argc > 0) ? argv + 2 : NULL;
+        char* src = readWholeFile(argv[1]);
+        if (!src) { printf("Tidak bisa membuka file: %s\n", argv[1]); return 1; }
+        StrList included; strListInit(&included);
+        char* processed = preprocessImports(src, &included);
+        free(src);
+        tokenize(processed);
+        run();
+        free(processed);
+    } else {
+        g_argc = 0; g_argv = NULL;
+        printf("Mode interaktif v18. Ketik 'Keluar' untuk berhenti.\n");
+        initTokens();
+        int exitRequested = 0;
+        while (!exitRequested) {
+            char buffer[65536];
+            buffer[0] = 0;
+            int depth = 0;
+            int inString = 0;
+            int first = 1;
+            int gotLine = 0;
+            while (1) {
+                printf(first ? "bahasaku> " : "........> ");
+                char line[8192];
+                if (!fgets(line, sizeof(line), stdin)) { exitRequested = 1; break; }
+                int l = strlen(line);
+                if (l>0 && line[l-1]=='\n') line[l-1]=0;
+                if (first) {
+                    char* p = line; while (*p==' '||*p=='\t') p++;
+                    if (strcmp(p,"Keluar")==0) { exitRequested = 1; break; }
+                    if (strlen(p)==0) break;
+                }
+                strcat(buffer, line);
+                strcat(buffer, "\n");
+                gotLine = 1;
+                for (int k=0; line[k]; k++) {
+                    char c = line[k];
+                    if (inString) {
+                        if (c=='\\') { k++; continue; }
+                        if (c=='"') inString = 0;
+                        continue;
+                    } else {
+                        if (c=='"') { inString = 1; continue; }
+                        if (c=='{') depth++;
+                        else if (c=='}') depth--;
+                    }
+                }
+                first = 0;
+                if (depth <= 0) break;
+            }
+            if (exitRequested) break;
+            if (!gotLine) continue;
+            int chunkStart = tokenCount;
+            tokenizeAppend(buffer);
+            preScanFunctions();
+            preScanStructs();
+            pos = chunkStart;
+            while (curTok()->type != TOK_AKHIR) parseStatement();
+        }
+    }
+    return 0;
+}
+

@@ -1,0 +1,8 @@
+mkdir -p build
+clang -O2 -Iinclude -c src/value.c -o build/value.o
+clang -O2 -Iinclude -c src/lexer.c -o build/lexer.o
+clang -O2 -Iinclude -c src/interpreter.c -o build/interpreter.o
+clang -O2 -Iinclude -c src/parser.c -o build/parser.o
+clang -O2 -Iinclude -c src/builtin.c -o build/builtin.o
+clang -O2 -Iinclude -c src/main.c -o build/main.o
+clang build/value.o build/lexer.o build/interpreter.o build/parser.o build/builtin.o build/main.o -o myrun -lm

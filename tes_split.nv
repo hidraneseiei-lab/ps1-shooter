@@ -1,0 +1,52 @@
+Cetak("=== Tes dasar setelah pemisahan komponen ===");
+Objek VM {
+    stack
+    Metode Jalankan(program) {
+        Var i = 0;
+        Selama (i < Panjang(program)) {
+            Var instr = program[i];
+            Var op = instr["op"];
+            Jika (op == "PUSH") {
+                Tambah(Ini.stack, instr["nilai"]);
+            } Lainnya Jika (op == "ADD") {
+                Var b = HapusAkhir(Ini.stack);
+                Var a = HapusAkhir(Ini.stack);
+                Tambah(Ini.stack, a + b);
+            } Lainnya Jika (op == "PRINT") {
+                Cetak(Ini.stack[Panjang(Ini.stack) - 1]);
+            }
+            i = i + 1;
+        }
+    }
+}
+Var mesin = Buat(VM);
+mesin.stack = [];
+mesin.Jalankan([{"op":"PUSH","nilai":10},{"op":"PUSH","nilai":5},{"op":"ADD"},{"op":"PRINT"}]);
+
+Cetak("");
+Cetak("=== Closure ===");
+Fungsi Pembuat(x) { Kembali Fungsi() { Kembali x; }; }
+Var a = Pembuat(10);
+Var b = Pembuat(20);
+Cetak(a(), b());
+
+Cetak("");
+Cetak("=== Tetap + compound assignment ===");
+Tetap PI_SAYA = 3.14;
+Cetak(PI_SAYA);
+Var x = 10;
+x += 5;
+Cetak(x);
+
+Cetak("");
+Cetak("=== JSON ===");
+Var data = {nama: "Budi", umur: 30};
+Cetak(KeJSON(data));
+
+Cetak("");
+Cetak("=== Kamus + dot notation ===");
+Var orang = {nama: "Budi"};
+Cetak(orang.nama);
+
+Cetak("");
+Cetak("=== SEMUA TES SELESAI ===");
